@@ -1,0 +1,221 @@
+"""
+High-level entry point for inference.
+Partial order extraction, permutation generation, bound aggregation
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import networkx as nx
+import numpy as np
+from loguru import logger
+
+from solver import LPSolver, VectorizedCanonicalBasis
+from symbolic import CounterfactualTerm, Event, Query, Variable
+
+
+class ConservativePID:
+    def __init__(
+        self,
+        variables: List[Variable],
+        observational_data: Dict[Tuple[Any, ...], float],
+    ):
+        self.variables = variables
+        self.data = observational_data
+
+    def infer(
+        self, query: Query, fixed_order: Optional[List[str]] = None
+    ) -> Tuple[float, float]:
+        """
+        Computes bounds for a query.
+
+        Args:
+            query: The causal query P(gamma | delta).
+            fixed_order: (Optional) A list of variable names ['X', 'Z', 'Y'] representing
+                            the known topological sort. If provided, skips permutation search.
+                            NB: this only works with variables names for now.
+
+        Returns:
+            Tuple[float, float]: The lower and upper bounds for the query.
+        """
+        self._validate_inputs(query)
+
+        if fixed_order:
+            logger.info(f"Using fixed causal order: {fixed_order}")
+
+            if set(fixed_order) != set(v.name for v in self.variables):
+                raise ValueError(
+                    "Fixed order must contain exactly all defined variables."
+                )
+
+            # Convert names to Variable objects
+            # TODO: add the possibility pass a list of Variable objects instead of names
+            var_map = {v.name: v for v in self.variables}
+            ordered_vars = [var_map[name] for name in fixed_order]
+
+            # TODO: check if the fixed order allows the query
+
+            return self._solve_for_order(ordered_vars, query)
+
+        # NO ORDER KNOWN
+        # 1. Extract Partial Order from Query
+        partial_order = self._extract_partial_order(query)
+
+        # 2. Generate Linear Extensions
+        try:
+            valid_orders = list(nx.all_topological_sorts(partial_order))
+        except nx.NetworkXUnfeasible:
+            raise ValueError(
+                "Query implies a cyclic dependency, which is impossible in a recursive SCM."
+            )
+
+        logger.info(
+            f"Found {len(valid_orders)} valid causal orders compatible with the query."
+        )
+
+        global_lb = float("inf")
+        global_ub = float("-inf")
+
+        # 3. Iterate and Aggregate
+        for i, order_names in enumerate(valid_orders):
+            var_map = {v.name: v for v in self.variables}
+            ordered_vars = [var_map[name] for name in order_names]
+
+            logger.info(f"Processing Order {i + 1}/{len(valid_orders)}: {order_names}")
+
+            lb, ub = self._solve_for_order(ordered_vars, query)
+
+            # Update Global Bounds (Algorithm 2: min of LBs, max of UBs)
+            if not np.isnan(lb):
+                global_lb = min(global_lb, lb)
+            if not np.isnan(ub):
+                global_ub = max(global_ub, ub)
+
+        return global_lb, global_ub
+
+    def _solve_for_order(
+        self, ordered_vars: List[Variable], query: Query
+    ) -> Tuple[float, float]:
+        """
+        Helper to run the pipeline for a single specific order.
+        """
+        # A. Build Basis
+        # Note: In production, you might want to cache this if the order repeats
+        basis = VectorizedCanonicalBasis(ordered_vars)
+
+        # B. Initialize Solver
+        solver = LPSolver(basis, self.data, ordered_vars)
+
+        # C. Solve
+        return solver.solve(query)
+
+    def _extract_partial_order(self, query: Query) -> nx.DiGraph:
+        """
+        Builds a DAG representing the strict partial order implied by the query.
+
+        Args:
+            query: The causal query P(gamma | delta).
+
+        Returns:
+            A directed acyclic graph (DAG) representing the strict partial order.
+        """
+        G = nx.DiGraph()
+        G.add_nodes_from([v.name for v in self.variables])
+
+        terms = list(query.target.assignments.keys())
+        if query.evidence:
+            terms.extend(query.evidence.assignments.keys())
+
+        for term in terms:
+            self._add_subscript_constraints(G, term)
+
+        return G
+
+    def _add_subscript_constraints(self, G: nx.DiGraph, term: CounterfactualTerm):
+        """
+        Recursively adds constraints to the graph based on the counterfactual term.
+        Modify in-place the associated DAG.
+        Ref: proposition 2.1 of the paper.
+
+        Args:
+            G: The graph to add constraints to.
+            term: The counterfactual term to add constraints for.
+        """
+        target = term.variable.name
+        for var, val in term.intervention.items():
+            cause = var.name
+            if not G.has_edge(cause, target):
+                G.add_edge(cause, target)
+            if isinstance(val, CounterfactualTerm):
+                self._add_term_constraints(G, val)
+
+    def _validate_inputs(self, query: Query):
+        """
+        Performs validation on variables, data, and the query.
+
+        Args:
+            query: The causal query P(gamma | delta).
+        """
+        # 1. Check Variables
+        for var in self.variables:
+            if var.domain is None or len(var.domain) == 0:
+                raise ValueError(f"Variable '{var.name}' must have a non-empty domain.")
+
+        # 2. Check Observational Data
+        expected_len = len(self.variables)
+        total_prob = 0.0
+
+        for row, prob in self.data.items():
+            if len(row) != expected_len:
+                raise ValueError(
+                    f"Data row {row} has length {len(row)}, expected {expected_len} (variables: {[v.name for v in self.variables]})."
+                )
+            # Check domain compatibility
+            for i, val in enumerate(row):
+                if val not in self.variables[i].domain:
+                    raise ValueError(
+                        f"Value '{val}' in data row {row} is not in domain of variable '{self.variables[i].name}'."
+                    )
+
+            if prob < 0 or prob > 1:
+                raise ValueError(
+                    f"Probability {prob} in data is invalid. Must be between 0 and 1."
+                )
+
+            total_prob += prob
+
+        if not np.isclose(total_prob, 1.0, atol=1e-5):
+            raise ValueError(
+                f"Observational probabilities sum to {total_prob}, expected 1.0."
+            )
+
+        # 3. Check Query
+        known_vars = set(self.variables)
+
+        # Helper to check an event
+        def check_event(event: Event, context: str):
+            for term, val in event.assignments.items():
+                if term.variable not in known_vars:
+                    raise ValueError(
+                        f"Unknown variable '{term.variable.name}' in query {context}."
+                    )
+
+                # Recursively check intervention variables
+                self._check_intervention_vars(term, known_vars)
+
+        if not isinstance(query.target, Event):
+            raise TypeError("Query target must be an Event object.")
+        check_event(query.target, "target")
+
+        if query.evidence:
+            if not isinstance(query.evidence, Event):
+                raise TypeError("Query evidence must be an Event object.")
+            check_event(query.evidence, "evidence")
+
+    def _check_intervention_vars(self, term: CounterfactualTerm, known_vars: set):
+        for var, val in term.intervention.items():
+            if var not in known_vars:
+                raise ValueError(
+                    f"Unknown intervention variable '{var.name}' in term '{term}'."
+                )
+            if isinstance(val, CounterfactualTerm):
+                self._check_intervention_vars(val, known_vars)
