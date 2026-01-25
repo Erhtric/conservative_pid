@@ -1,0 +1,22 @@
+
+site_name: Conservative PID Documentation
+theme:
+  name: material
+  palette:
+    # Primary color
+    primary: teal
+    accent: purple
+    
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+
+nav:
+  - Home: index.md
+  - API Reference:
+      - Symbolic: api/symbolic.md
+      - Canonical: api/canonical.md
+      - Solver: api/solver.md

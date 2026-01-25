@@ -1,0 +1,4 @@
+
+# Canonical Module
+
+::: canonical

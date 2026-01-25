@@ -1,0 +1,25 @@
+[project]
+name = "conservative-pid"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel>=7.1.0",
+    "loguru>=0.7.3",
+    "numpy>=2.4.1",
+    "pulp>=3.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.1",
+    "mkdocstrings[python]>=1.0.2",
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "."
+]

@@ -1,0 +1,4 @@
+
+# Solver Module
+
+::: solver
