@@ -1,11 +1,27 @@
 
-site_name: Conservative PID Documentation
+site_name: Conservative Partial IDentification Documentation
 theme:
   name: material
   palette:
-    # Primary color
-    primary: teal
-    accent: purple
+    # Palette toggle for automatic mode
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+
+    # Palette toggle for light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7 
+        name: Switch to dark mode
+
+    # Palette toggle for dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
     
 plugins:
   - search
@@ -20,3 +36,12 @@ nav:
       - Symbolic: api/symbolic.md
       - Canonical: api/canonical.md
       - Solver: api/solver.md
+      - Inference: api/inference.md
+
+markdown_extensions:
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js

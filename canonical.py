@@ -7,166 +7,21 @@ from loguru import logger
 from symbolic import CounterfactualTerm, Event, Variable
 
 
-class CanonicalConfiguration:
-    """
-    Represent a single deterministic world 'omega'.
-    In this world, every counterfactual term Y_{X=x} is assigned a value.
-
-    Example:
-        X = Variable("X", domain=(0, 1))
-        Y = Variable("Y", domain=(0, 1))
-        omega = CanonicalConfiguration({
-            X: 0,
-            Y: 1,  // This can be removed since it is a deterministic function of the other two responses
-            Y @ {X: 1}: 0,
-            Y @ {X: 0}: 1,
-        })
-
-    """
-
-    def __init__(
-        self,
-        functions: Dict[Variable, Dict[Tuple[Any, ...], Any]],
-        order: List[Variable],
-    ):
-        self.functions = functions
-        self.order = order  # The topological order defining parentage
-        self.parents_map = self._build_parents_map(order)
-
-    def _build_parents_map(
-        self, order: List[Variable]
-    ) -> Dict[Variable, List[Variable]]:
-        """
-        Constructs the parent set for each variable based on the total order.
-        For a fully connected DAG (conservative), parents are all predecessors in 'order'.
-        """
-        parents = {}
-        for i, var in enumerate(order):
-            parents[var] = order[:i]
-        return parents
-
-    def evaluate(self, term: CounterfactualTerm) -> Any:
-        """
-        Recursively evaluate a counterfactual term, i.e., Y @ {X: x, Z: z}
-        in this deterministic world.
-        Ref: Theorem 3.3 in the paper.
-        """
-        target_var = term.variable
-        intervention = term.intervention
-
-        # 1. Check if the variable is directly intervened on
-        if target_var in intervention:
-            val = intervention[target_var]
-
-            # Nested case
-            if isinstance(val, CounterfactualTerm):
-                return self.evaluate(val)
-
-            # Base case: value is a constant
-            return val
-
-        # 2. If not intervened, then it is a response variable
-        # It follows its structural equation
-
-        # First evaluate its parents
-        parents = self.parents_map[target_var]
-
-        parent_values = []
-        for p in parents:
-            # Recursive step:
-            # The value of a parent P is P_{assignment_of_current_term}
-            # Effectively, the intervention propagates down.
-
-            # Construct the term for the parent
-            parent_term = CounterfactualTerm(p, intervention)
-            parent_val = self.evaluate(parent_term)
-            parent_values.append(parent_val)
-
-        # 3. Apply the deterministic function for this variable
-        func = self.functions[target_var]
-        return func[tuple(parent_values)]
-
-    def satisfies(self, event: Event) -> bool:
-        """
-        Check if this canonical configuration satisfies a given event.
-        """
-        for term, required_value in event.assignments.items():
-            if self.evaluate(term) != required_value:
-                return False
-        return True
-
-    def is_compatible(self, observation: Event) -> bool:
-        """
-        Checks if this world is compatible with a pure observation v.
-        omega |= v
-        """
-        # An observation is just a special case of an event where intervention is empty
-        for term, val in observation.assignments.items():
-            # term is CounterfactualTerm(variable, {})
-            if self.evaluate(term) != val:
-                return False
-        return True
-
-
-class BasisGenerator:
-    """
-    Generate a basis of canonical configurations for a given set of variables.
-    """
-
-    def __init__(self, variables: List[Variable]):
-        self.variables = variables
-        self.basis = []
-
-        self.check_domains()
-
-    def check_domains(self):
-        for var in self.variables:
-            if var.domain is None:
-                raise ValueError(f"Variable {var} has no domain.")
-
-    def generate_basis(self) -> List[CanonicalConfiguration]:
-        # Process variables in order
-        # For each variable
-
-        all_var_functions = []
-        for i, var in enumerate(self.variables):
-            parents = self.variables[:i]
-
-            # 1. Generate all parent configurations
-            parent_domains = [p.domain for p in parents]
-            parent_configs = list(itertools.product(*parent_domains))
-
-            # 2. Generate all possible functions for this variable
-            # This is equivalent to generating all possible canonical configurations.
-            pot_out = list(itertools.product(var.domain, repeat=len(parent_configs)))
-
-            # 3. Create dicts for these functions
-            var_funcs = []
-            for out in pot_out:
-                # Map (parent_config) -> outputG
-                f_map = {cfg: res for cfg, res in zip(parent_configs, out)}
-                var_funcs.append(f_map)
-
-            all_var_functions.append(var_funcs)
-
-        # 4. Generate all possible configurations
-        basis = []
-        for var_funcs in itertools.product(*all_var_functions):
-            # var_funcs is tuple(func_v1, func_v2, ...)
-            func_map = {var: func for var, func in zip(self.variables, var_funcs)}
-            basis.append(CanonicalConfiguration(func_map, self.variables))
-
-        return basis
-
-
 class VectorizedCanonicalBasis:
     """
-    A Numpy-based implementation of the canonical basis.
+    A Numpy-based implementation of the canonical basis .
+
+    We store the basis as a list of matrices, where each matrix is of shape
+    (N_worlds, N_functions).
+    A stride array is stored for each variable, indicating the stride for each parent.
     """
 
     def __init__(self, variables: List[Variable]):
         """
-        Initializes the basis with the given variables.
+        Initializes the basis.
+
+        Args:
+            variables: List of variables in the causal model. The order is implicit.
         """
         self.variables = variables
         self.var_to_idx = {var: i for i, var in enumerate(variables)}
@@ -260,6 +115,7 @@ class VectorizedCanonicalBasis:
         """
         Evaluates the term in every world.
         Returns an array of shape (N_worlds,) containing the value of 'term' in every world.
+        In other words, it returns the column of the basis matrix corresponding to 'term'.
 
         Args:
             term: The term to evaluate.
@@ -306,10 +162,16 @@ class VectorizedCanonicalBasis:
         row_indices = np.arange(self.n_worlds)
         return self.func_tables[var_idx][row_indices, col_indices]
 
-    def get_mask(self, event: Event) -> np.ndarray:
+    def get_event_mask(self, event: Event) -> np.ndarray:
         """
         Returns a boolean array (N_worlds,) where True indicates the world satisfies the event.
         omega |- gamma
+
+        Args:
+            event: The event to evaluate.
+
+        Returns:
+            np.ndarray: A boolean array of shape (N_worlds,) where True indicates the world satisfies the event.
         """
         mask = np.ones(self.n_worlds, dtype=bool)
 
@@ -325,13 +187,19 @@ class VectorizedCanonicalBasis:
 
         return mask
 
-    def get_compatibility_mask(self, observation: Dict[Variable, Any]) -> np.ndarray:
+    def get_observation_mask(self, observation: Dict[Variable, Any]) -> np.ndarray:
         """
         Returns boolean mask for worlds compatible with observational data.
         omega |= v
+
+        Args:
+            observation: A dictionary mapping variables to their observed values.
+
+        Returns:
+            np.ndarray: A boolean array of shape (N_worlds,) where True indicates the world is compatible with the observation.
         """
         # Convert observation dict to Event (intervention is empty)
         obs_event = Event(
             {CounterfactualTerm(v, {}): val for v, val in observation.items()}
         )
-        return self.get_mask(obs_event)
+        return self.get_event_mask(obs_event)
