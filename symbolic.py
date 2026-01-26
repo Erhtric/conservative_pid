@@ -1,18 +1,25 @@
 """
 Defines the symbolic language for causal inference: Variables, Interventions,
-Counterfactual Terms, and Events.
+Counterfactual Terms, Events, Queries
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
+
+from loguru import logger
 
 
 @dataclass(frozen=True)
 class Variable:
     """
-    Represents a random variable with a finite domain
+    Represents a random variable with a finite domain. In this simplified
+    representation we allow a variable to have an identificative name and a
+    domain of values.
+
+    In this sense, it is an immutable object with an hashable name. This means that we
+    allow two variables with different domains to have the same name.
     """
 
     name: str
@@ -46,7 +53,14 @@ class Variable:
 @dataclass(frozen=True)
 class CounterfactualTerm:
     """
-    Represents a counterfactual term Y_{X=x}
+    Represents a counterfactual term $Y_{\mathbf{X}=\mathbf{x}}$, or in short $Y_{\mathbf{x}}$.
+    This is the equivalent of the Pearl's notation $Y$ in a world where ${do(X=x)}$.
+
+    Usage:
+    ```python
+    Y @ {X: 1} # Y_{X=1}
+    Y @ {X:1, W: W @ {X: 0}} # Y_{X=1, W_{X=0}}
+    ```
     """
 
     variable: Variable
@@ -94,6 +108,79 @@ class Event:
 
     assignments: Dict[CounterfactualTerm, Any] = field(default_factory=dict)
 
+    def expand(self) -> List[Event]:
+        """
+        Applies the Counterfactual Unnesting Theorem (CUT) once.
+
+        TODO: Make this recursive. We can at the end call expand when extending the list of events.
+
+        Example:
+        Input: (Y_{X_z}=y)
+        Output: [{Y_{X=0}=y & X_z=0}, {Y_{X=1}=y & X_z=1}, ...]
+
+        Args:
+            None
+
+        Returns:
+            A list of events
+
+        Raises:
+            ValueError: If there are contradictory assignments.
+        """
+        # Identify which terms are nested if there are any
+        nested_term_loc = None
+
+        for term in self.assignments.keys():
+            for int_var, int_val in term.intervention.items():
+                if isinstance(int_val, CounterfactualTerm):
+                    # Nested: term has intervention {int_var: int_val}
+                    nested_term_loc = (term, int_var, int_val)
+                    break
+                if nested_term_loc:
+                    break
+
+        # Base case: no nesting found, return self as a single item list
+        if not nested_term_loc:
+            return [self]
+
+        # Recursive step: unnest the first nesting found
+        outer_term: CounterfactualTerm = nested_term_loc[0]
+        inner_var: Variable = nested_term_loc[1]
+        inner_term: CounterfactualTerm = nested_term_loc[2]
+
+        expanded_events = []
+        # Iterate over the domain of the inner variable
+        for val in inner_var.domain:
+            # Create a new event with two atomic propositions
+            # 1. The outer term with the intervention set to the current value
+            # Note this modification of the subscript holds only for the inner_var variable, the others are left untouched
+            new_outer_term = CounterfactualTerm(
+                outer_term.variable,
+                {**outer_term.intervention, inner_var: val},
+            )
+
+            # 2. The inner term with the intervention set to the current value while keeping the rest of the intervention
+            new_inner_term = CounterfactualTerm(
+                inner_term.variable,
+                {**inner_term.intervention},
+            )
+
+            # Create a new event with the two atomic propositions
+            conjunction = Event(
+                {new_outer_term: self.assignments[outer_term], new_inner_term: val}
+            )
+
+            # Check for conflict, if the inner term is already assigned a different value, raise an error
+            if inner_term in self.assignments and self.assignments[inner_term] != val:
+                raise ValueError(
+                    f"Contradictory assignments. {inner_term} cannot be both {self.assignments[inner_term]} and {val}"
+                )
+
+            # Add the new event to the list of expanded events
+            expanded_events.extend(conjunction)
+
+        return expanded_events
+
     def __and__(self, other: Event) -> Event:
         """
         Syntax sugar for creating a conjunction of events.
@@ -131,10 +218,14 @@ class Event:
 class Query:
     """
     Represents a probability query P(target | evidence)
+
+    Args:
+        target: The target event
+        evidence: The evidence event
     """
 
     target: Event
-    evidence: Event
+    evidence: Event = field(default_factory=Event)
 
     def __repr__(self):
         if self.evidence:

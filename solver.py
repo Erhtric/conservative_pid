@@ -1,6 +1,5 @@
 """
 Translates the Canonical Representation into a Linear Program using PuLP.
-Handles both unconditional queries (Standard LP) and conditional queries (Linear-Fractional).
 """
 
 from typing import Any, Dict, List, Tuple
@@ -23,10 +22,14 @@ class LPSolver:
         """
         Initializes the solver with the pre-computed canonical basis and observational data.
 
-        :param basis: The list of all deterministic worlds (Omega).
-        :param observational_data: A dictionary mapping variable value tuples to probabilities.
-                                   e.g., {(0, 1): 0.4, ...} for variables (X, Y).
-        :param variables: The list of variables corresponding to the data tuples.
+        Args:
+            basis: The list of all deterministic worlds (Omega).
+            observational_data: A dictionary mapping variable value tuples to probabilities.
+                                e.g., {(0, 1): 0.4, ...} for variables (X, Y).
+            variables: The list of variables corresponding to the data tuples.
+
+        Raises:
+            ValueError: If the observational data is inconsistent with the causal order.
         """
         self.basis = basis
         self.data = observational_data
@@ -39,20 +42,35 @@ class LPSolver:
 
     def _build_compatibility_map(self) -> Dict[Tuple[Any, ...], List[int]]:
         """
-        Optimized version using NumPy masks.
+        Builds a map from each observation to the list of compatible worlds.
+        It is the equivalent of checking the consistency of the observational data with the causal order.
         """
         compatibility = {}
         for row in self.data.keys():
             obs_dict = {var: val for var, val in zip(self.variables, row)}
-
-            # Get boolean mask from VectorizedBasis
-            mask = self.basis.get_compatibility_mask(obs_dict)
+            mask = self.basis.get_observation_mask(obs_dict)
 
             # Convert to list of indices for PuLP
-            # np.where returns a tuple, take [0]
             indices = np.where(mask)[0].tolist()
             compatibility[row] = indices
         return compatibility
+
+    def _get_objective_mask(self, target_event: Event) -> np.ndarray:
+        """
+        Helper method to get the objective mask for a given target event.
+        """
+        # 1. Expand the event if nested
+        disjunctive_events = target_event.expand()
+
+        # 2. Compute mask for the first event
+        final_mask = self.basis.get_event_mask(disjunctive_events[0])
+
+        # 3. Compute mask for the remaining events
+        for event in disjunctive_events[1:]:
+            mask = self.basis.get_event_mask(event)
+            final_mask = np.logical_or(final_mask, mask)
+
+        return final_mask
 
     def solve(self, query: Query) -> Tuple[float, float]:
         """
@@ -61,15 +79,15 @@ class LPSolver:
         """
         if query.evidence:
             # Use Charnes-Cooper transformation for P(gamma | delta)
-            lb = self._solve_linear_fractional(query, sense=pulp.LpMinimize)
-            ub = self._solve_linear_fractional(query, sense=pulp.LpMaximize)
+            _, lb = self._solve_linear_fractional(query, sense=pulp.LpMinimize)
+            _, ub = self._solve_linear_fractional(query, sense=pulp.LpMaximize)
         else:
-            lb = self._solve_standard_lp(query, sense=pulp.LpMinimize)
-            ub = self._solve_standard_lp(query, sense=pulp.LpMaximize)
+            _, lb = self._solve_standard_lp(query, sense=pulp.LpMinimize)
+            _, ub = self._solve_standard_lp(query, sense=pulp.LpMaximize)
 
         return lb, ub
 
-    def _solve_standard_lp(self, query: Query, sense) -> float:
+    def _solve_standard_lp(self, query: Query, sense) -> Tuple[pulp.LpStatus, float]:
         """
         Implements Algorithm 1 (Def 3.4).
         Min/Max sum(q_omega) subject to observational constraints.
@@ -84,13 +102,14 @@ class LPSolver:
         # 1. Define the Problem
         prob = pulp.LpProblem("Counterfactual_Bounding", sense)
 
-        # 2. Decision Variables: q_omega >= 0
-        # We use a dictionary or list to hold LpVariables
-        q_vars = [pulp.LpVariable(f"q_{i}", lowBound=0) for i in range(len(self.basis))]
+        # 2. Decision Variables
+        q_vars = [
+            pulp.LpVariable(f"q_{i}", lowBound=0) for i in range(self.basis.n_worlds)
+        ]
 
         # 3. Objective Function: P(gamma) = sum(q_omega where omega |- gamma)
         # Theorem 3.3
-        objective_mask = self.basis.get_mask(query.target)
+        objective_mask = self._get_objective_mask(query.target)
         objective_indices = np.where(objective_mask)[0].tolist()
         prob += pulp.lpSum([q_vars[i] for i in objective_indices])
 
@@ -122,9 +141,11 @@ class LPSolver:
         if prob.status != pulp.LpStatusOptimal:
             return float("nan")  # Or handle infeasibility appropriately
 
-        return pulp.value(prob.objective)
+        return prob, pulp.value(prob.objective)
 
-    def _solve_linear_fractional(self, query: Query, sense) -> float:
+    def _solve_linear_fractional(
+        self, query: Query, sense
+    ) -> Tuple[pulp.LpStatus, float]:
         """
         Implements Charnes-Cooper transformation for Conditional Queries.
         Section 5.1 [cite: 231-235].
@@ -134,7 +155,8 @@ class LPSolver:
         # 1. Transformed Variables
         # q_prime corresponds to q_omega * t
         q_prime_vars = [
-            pulp.LpVariable(f"q_prime_{i}", lowBound=0) for i in range(len(self.basis))
+            pulp.LpVariable(f"q_prime_{i}", lowBound=0)
+            for i in range(self.basis.n_worlds)
         ]
         # t is the inverse of the probability of the evidence P(delta)
         t = pulp.LpVariable("t", lowBound=0)
@@ -175,4 +197,4 @@ class LPSolver:
         if prob.status != pulp.LpStatusOptimal:
             return float("nan")
 
-        return pulp.value(prob.objective)
+        return prob, pulp.value(prob.objective)
