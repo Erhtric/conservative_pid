@@ -1,6 +1,6 @@
 import pytest
 
-from symbolic import CounterfactualTerm, Event, P, Query, Variable
+from symbolic import CounterfactualTerm, Event, Expression, P, Query, Variable
 
 
 def test_variable_equality():
@@ -95,3 +95,45 @@ def test_query():
 
     q3 = P(joint_event)
     assert str(q3) == "P(X = 1 & Y = 0)"
+
+
+def test_expression_operations():
+    X = Variable("X")
+    Y = Variable("Y")
+
+    q1 = P(X == 1)
+    q2 = P(Y == 1)
+
+    # 1. Query + Query -> Expression
+    expr = q1 + q2
+    assert isinstance(expr, Expression)
+    assert len(expr.terms) == 2
+    assert expr.terms[q1] == 1.0
+    assert expr.terms[q2] == 1.0
+
+    # 2. Query - Query
+    expr_diff = q1 - q2
+    assert expr_diff.terms[q1] == 1.0
+    assert expr_diff.terms[q2] == -1.0
+
+    # 3. Scalar Multiplication
+    expr_mul = q1 * 2.0
+    assert expr_mul.terms[q1] == 2.0
+
+    expr_rmul = 3.0 * q2
+    assert expr_rmul.terms[q2] == 3.0
+
+    # 4. Negation
+    expr_neg = -q1
+    assert expr_neg.terms[q1] == -1.0
+
+    # 5. Expression Arithmetic
+    # (q1 + q2) + q1 -> 2*q1 + q2
+    expr_comb = expr + q1
+    assert expr_comb.terms[q1] == 2.0
+    assert expr_comb.terms[q2] == 1.0
+
+    # Expression - Query
+    expr_sub = expr - q1
+    assert q1 not in expr_sub.terms
+    assert expr_sub.terms[q2] == 1.0

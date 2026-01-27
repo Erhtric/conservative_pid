@@ -8,8 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Union
 
-from loguru import logger
-
 
 @dataclass(frozen=True)
 class Variable:
@@ -73,6 +71,7 @@ class CounterfactualTerm:
         return hash((self.variable, frozenset(self.intervention.items())))
 
     def __repr__(self):
+        # TODO: nested counterfactuals break this
         if not self.intervention:
             return self.variable.name
 
@@ -103,6 +102,7 @@ class Event:
     """
     Represents an event, i.e. a conjunction of atomic propositions:
     e.g., {Y_{X=1}: 0, Z_{X=1, Y=0}: 1}
+    An atomic proposition in this context is a counterfactual term with a value.
     Stored as a dictionary mapping counterfactual terms to their values.
     """
 
@@ -213,8 +213,11 @@ class Event:
     def __bool__(self):
         return bool(self.assignments)
 
+    def __hash__(self):
+        return hash(frozenset(self.assignments.items()))
 
-@dataclass
+
+@dataclass(frozen=True)
 class Query:
     """
     Represents a probability query P(target | evidence)
@@ -232,6 +235,75 @@ class Query:
             return f"P({self.target} | {self.evidence})"
         else:
             return f"P({self.target})"
+
+    def __add__(self, other: Union[Query, Expression]) -> Expression:
+        return Expression({self: 1.0}) + other
+
+    def __sub__(self, other: Union[Query, Expression]) -> Expression:
+        return Expression({self: 1.0}) - other
+
+    def __mul__(self, other: Union[float, int]) -> Expression:
+        return Expression({self: 1.0}) * other
+
+    def __rmul__(self, other: Union[float, int]) -> Expression:
+        return Expression({self: 1.0}) * other
+
+    def __neg__(self) -> Expression:
+        return Expression({self: -1.0})
+
+
+@dataclass(frozen=True)
+class Expression:
+    """
+    Represents a linear combination of queries (an Effect).
+    Form: sum(weight_i * query_i)
+    """
+
+    terms: Dict[Query, float] = field(default_factory=dict)
+
+    def __add__(self, other: Union[Expression, Query]) -> Expression:
+        new_terms = self.terms.copy()
+
+        if isinstance(other, Query):
+            # We assume equal contribution
+            new_terms[other] = new_terms.get(other, 0.0) + 1.0
+        elif isinstance(other, Expression):
+            for q, w in other.terms.items():
+                new_terms[q] = new_terms.get(q, 0.0) + w
+        else:
+            return NotImplemented
+
+        # Remove terms with zero weight to keep it clean
+        new_terms = {q: w for q, w in new_terms.items() if w != 0}
+        return Expression(terms=new_terms)
+
+    def __sub__(self, other: Union[Expression, Query]) -> Expression:
+        return self + (-other)
+
+    def __neg__(self) -> Expression:
+        return self * -1.0
+
+    def __mul__(self, other: Union[float, int]) -> Expression:
+        if not isinstance(other, (float, int)):
+            return NotImplemented
+        new_terms = {q: w * other for q, w in self.terms.items()}
+        return Expression(terms=new_terms)
+
+    def __rmul__(self, other: Union[float, int]) -> Expression:
+        return self.__mul__(other)
+
+    def __repr__(self):
+        parts = []
+        for q, w in self.terms.items():
+            sign = "+" if w >= 0 else "-"
+            # scalar 1 is implicit in printing if we want cleaner output
+            weight = f"{abs(w)} * " if abs(w) != 1.0 else ""
+            parts.append(f"{sign} {weight}{q}")
+
+        res = " ".join(parts).strip()
+        if res.startswith("+ "):
+            res = res[2:]
+        return res or "0.0"
 
 
 # Helper functions for creating queries
