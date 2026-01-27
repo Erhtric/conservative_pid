@@ -115,12 +115,12 @@ class ConservativePID:
         solver = LPSolver(basis, self.data, ordered_vars)
         return solver.solve(query)
 
-    def _extract_partial_order(self, query: Query) -> nx.DiGraph:
+    def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
         """
         Builds a DAG representing the strict partial order implied by the query.
 
         Args:
-            query: The causal query P(gamma | delta).
+            query: The causal query P(gamma | delta) or an Expression.
 
         Returns:
             A directed acyclic graph (DAG) representing the strict partial order.
@@ -128,12 +128,18 @@ class ConservativePID:
         G = nx.DiGraph()
         G.add_nodes_from([v.name for v in self.variables])
 
-        terms = list(query.target.assignments.keys())
-        if query.evidence:
-            terms.extend(query.evidence.assignments.keys())
+        if isinstance(query, Query):
+            queries = [query]
+        else:
+            queries = list(query.terms.keys())
 
-        for term in terms:
-            self._add_subscript_constraints(G, term)
+        for q in queries:
+            terms = list(q.target.assignments.keys())
+            if q.evidence:
+                terms.extend(q.evidence.assignments.keys())
+
+            for term in terms:
+                self._add_subscript_constraints(G, term)
 
         return G
 
@@ -153,7 +159,7 @@ class ConservativePID:
             if not G.has_edge(cause, target):
                 G.add_edge(cause, target)
             if isinstance(val, CounterfactualTerm):
-                self._add_term_constraints(G, val)
+                self._add_subscript_constraints(G, val)
 
     def _validate_inputs(self, query: Union[Query, Expression]):
         """
