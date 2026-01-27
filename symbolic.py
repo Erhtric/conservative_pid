@@ -6,7 +6,7 @@ Counterfactual Terms, Events, Queries
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, OrderedDict, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -47,11 +47,14 @@ class Variable:
         # Note: We return an Event, not a boolean. This overrides standard equality for values.
         return Event({CounterfactualTerm(self, {}): other})
 
+    def __lt__(self, other: Any) -> bool:
+        return self.name < other.name
+
 
 @dataclass(frozen=True)
 class CounterfactualTerm:
     """
-    Represents a counterfactual term $Y_{\mathbf{X}=\mathbf{x}}$, or in short $Y_{\mathbf{x}}$.
+    Represents a counterfactual term $Y_{X=x}$, or in short $Y_{x}$.
     This is the equivalent of the Pearl's notation $Y$ in a world where ${do(X=x)}$.
 
     Usage:
@@ -67,18 +70,18 @@ class CounterfactualTerm:
     )
 
     def __hash__(self):
-        # Convert mutable dictionary to hashable frozenset for hashing
-        return hash((self.variable, frozenset(self.intervention.items())))
+        # Sort intervention items to ensure order independence
+        items = tuple(sorted((k, v) for k, v in self.intervention.items()))
+        return hash((self.variable, items))
 
     def __repr__(self):
-        # TODO: nested counterfactuals break this
         if not self.intervention:
             return self.variable.name
 
         intervention_str = []
-        for var, val in self.intervention.items():
-            val_str = f"{val}" if isinstance(val, CounterfactualTerm) else f"{val}"
-            intervention_str.append(f"{var.name}={val_str}")
+        for var, val in sorted(self.intervention.items(), key=lambda x: x[0].name):
+            # If val is a CounterfactualTerm, its own __repr__ handles the nesting
+            intervention_str.append(f"{var.name}={val!r}")
 
         return f"{self.variable.name}_{{{', '.join(intervention_str)}}}"
 
@@ -96,6 +99,9 @@ class CounterfactualTerm:
         # Note: We return an Event, not a boolean. This overrides standard equality.
         return Event({self: other})
 
+    def __lt__(self, other):
+        return str(self) < str(other)
+
 
 @dataclass(frozen=True)
 class Event:
@@ -106,7 +112,7 @@ class Event:
     Stored as a dictionary mapping counterfactual terms to their values.
     """
 
-    assignments: Dict[CounterfactualTerm, Any] = field(default_factory=dict)
+    assignments: OrderedDict[CounterfactualTerm, Any] = field(default_factory=dict)
 
     def expand(self) -> List[Event]:
         """
@@ -148,6 +154,9 @@ class Event:
         inner_var: Variable = nested_term_loc[1]
         inner_term: CounterfactualTerm = nested_term_loc[2]
 
+        if inner_var.domain == ():
+            raise ValueError("Inner variable has no domain.")
+
         expanded_events = []
         # Iterate over the domain of the inner variable
         for val in inner_var.domain:
@@ -171,13 +180,13 @@ class Event:
             )
 
             # Check for conflict, if the inner term is already assigned a different value, raise an error
-            if inner_term in self.assignments and self.assignments[inner_term] != val:
-                raise ValueError(
-                    f"Contradictory assignments. {inner_term} cannot be both {self.assignments[inner_term]} and {val}"
-                )
+            # if inner_term in self.assignments and self.assignments[inner_term] != val:
+            #     raise ValueError(
+            #         f"Contradictory assignments. {inner_term} cannot be both {self.assignments[inner_term]} and {val}"
+            #     )
 
             # Add the new event to the list of expanded events
-            expanded_events.extend(conjunction)
+            expanded_events.append(conjunction)
 
         return expanded_events
 
@@ -198,23 +207,32 @@ class Event:
 
         return Event(new_assigments)
 
-    def __or__(self, other: Event) -> Event:
-        """
-        Syntax sugar for creating a disjunction of events.
-        Usage: event1 | event2
-        """
-        return Event({**self.assignments, **other.assignments})
+    # def __or__(self, other: Event) -> Event:
+    #     """
+    #     Syntax sugar for creating a disjunction of events.
+    #     Usage: event1 | event2
+    #     """
+    #     return Event({**self.assignments, **other.assignments})
 
     def __repr__(self):
-        return " & ".join(
-            [f"{term} = {value}" for term, value in self.assignments.items()]
-        )
+        # Sort by the string representation of the term for stability
+        items = []
+        for term, val in self.assignments.items():
+            items.append(f"{term!r}={val!r}")
+        return f"Event({', '.join(items)})"
 
     def __bool__(self):
         return bool(self.assignments)
 
     def __hash__(self):
-        return hash(frozenset(self.assignments.items()))
+        # Sort assignments by term string/hash
+        items = tuple(sorted(self.assignments.items(), key=lambda x: str(x[0])))
+        return hash(items)
+
+    def __eq__(self, other):
+        if not isinstance(other, Event):
+            return False
+        return self.assignments == other.assignments
 
 
 @dataclass(frozen=True)
@@ -230,11 +248,19 @@ class Query:
     target: Event
     evidence: Event = field(default_factory=Event)
 
+    def expand(self) -> Expression:
+        """Expand the query"""
+        # Expand the target event into disjoint events (summation)
+        expanded_targets = self.target.expand()
+
+        # Return an Expression summing over the expanded queries
+        return Expression({Query(t, self.evidence): 1.0 for t in expanded_targets})
+
     def __repr__(self):
         if self.evidence:
-            return f"P({self.target} | {self.evidence})"
+            return f"P({self.target!r} | {self.evidence!r})"
         else:
-            return f"P({self.target})"
+            return f"P({self.target!r})"
 
     def __add__(self, other: Union[Query, Expression]) -> Expression:
         return Expression({self: 1.0}) + other
@@ -319,6 +345,9 @@ def P(target: Event, evidence: Event = None) -> Query:
     Returns:
         A query
     """
+    if not isinstance(target, Event):
+        raise ValueError("Target must be an Event")
+
     if evidence is None:
         evidence = Event()
     return Query(target, evidence)

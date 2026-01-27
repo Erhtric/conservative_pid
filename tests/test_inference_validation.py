@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from inference import ConservativePID
-from symbolic import CounterfactualTerm, Event, P, Variable
+from symbolic import CounterfactualTerm, Event, P, Query, Variable
 
 
 def test_inference_validation_variables():
@@ -67,10 +67,35 @@ def test_inference_validation_query():
     with pytest.raises(ValueError, match="Unknown intervention variable 'Z'"):
         pid.infer(P(e))
 
-    class FakeQuery:
-        def __init__(self):
-            self.target = "NotAnEvent"
-            self.evidence = None
-
+    # TEST 10: Invalid target type
+    # We pass a real Query object so it passes the top-level type check,
+    # but with an invalid target to fail the inner check.
+    q_invalid = Query(target="NotAnEvent")  # type: ignore
     with pytest.raises(TypeError, match="Query target must be an Event object"):
-        pid.infer(FakeQuery())  # Type ignore
+        pid.infer(q_invalid)
+
+
+def test_inference_validation_expression():
+    X = Variable("X", domain=(0, 1))
+    data = {(0,): 1.0}
+    pid = ConservativePID([X], data)
+
+    # Valid expression
+    q1 = P(X == 0)
+    q2 = P(X == 1)
+    expr = q1 + q2
+    # Should pass validation
+    pid._validate_inputs(expr)
+
+    # Expression with invalid variable
+    Z = Variable("Z", domain=(0, 1))
+    q_bad = P(Z == 0)
+    expr_bad = q1 + q_bad
+    with pytest.raises(ValueError, match="Unknown variable 'Z'"):
+        pid._validate_inputs(expr_bad)
+
+    # Input neither Query nor Expression
+    with pytest.raises(
+        TypeError, match="Input must be a Query or an Expression object"
+    ):
+        pid._validate_inputs("NotAQuery")  # type: ignore

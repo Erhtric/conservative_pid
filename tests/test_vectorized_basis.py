@@ -61,7 +61,7 @@ def test_vectorized_mask():
 
     # Event: X=1 & Y=0
     event = (X == 1) & (Y == 0)
-    mask = vec_basis.get_mask(event)
+    mask = vec_basis.get_event_mask(event)
 
     # Manual check
     term_X = CounterfactualTerm(X, {})

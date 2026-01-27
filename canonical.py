@@ -1,5 +1,5 @@
 import itertools
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Union
 
 import numpy as np
 from loguru import logger
@@ -9,7 +9,7 @@ from symbolic import CounterfactualTerm, Event, Variable
 
 class VectorizedCanonicalBasis:
     """
-    A Numpy-based implementation of the canonical basis .
+    A Numpy-based implementation of the canonical basis for counterfactuals.
 
     We store the basis as a list of matrices, where each matrix is of shape
     (N_worlds, N_functions).
@@ -21,7 +21,7 @@ class VectorizedCanonicalBasis:
         Initializes the basis.
 
         Args:
-            variables: List of variables in the causal model. The order is implicit.
+            variables: List of **ordered** variables in the causal model.
         """
         self.variables = variables
         self.var_to_idx = {var: i for i, var in enumerate(variables)}
@@ -162,9 +162,10 @@ class VectorizedCanonicalBasis:
         row_indices = np.arange(self.n_worlds)
         return self.func_tables[var_idx][row_indices, col_indices]
 
-    def get_event_mask(self, event: Event) -> np.ndarray:
+    def get_mask(self, event: Union[Event]) -> np.ndarray:
         """
         Returns a boolean array (N_worlds,) where True indicates the world satisfies the event.
+        Logic corresponds to Theorems 3.2 (Observational) and 3.3 (Counterfactual) in the paper.
         omega |- gamma
 
         Args:
@@ -186,20 +187,3 @@ class VectorizedCanonicalBasis:
             mask &= term_values_coded == req_code
 
         return mask
-
-    def get_observation_mask(self, observation: Dict[Variable, Any]) -> np.ndarray:
-        """
-        Returns boolean mask for worlds compatible with observational data.
-        omega |= v
-
-        Args:
-            observation: A dictionary mapping variables to their observed values.
-
-        Returns:
-            np.ndarray: A boolean array of shape (N_worlds,) where True indicates the world is compatible with the observation.
-        """
-        # Convert observation dict to Event (intervention is empty)
-        obs_event = Event(
-            {CounterfactualTerm(v, {}): val for v, val in observation.items()}
-        )
-        return self.get_event_mask(obs_event)

@@ -3,6 +3,7 @@ High-level entry point for inference.
 Partial order extraction, permutation generation, bound aggregation
 """
 
+from ctypes import Union
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -10,26 +11,37 @@ import numpy as np
 from loguru import logger
 
 from solver import LPSolver, VectorizedCanonicalBasis
-from symbolic import CounterfactualTerm, Event, Query, Variable
+from symbolic import CounterfactualTerm, Event, Expression, Query, Variable
 
 
 class ConservativePID:
+    """
+    Conservative PID inference engine.
+    """
+
     def __init__(
         self,
         variables: List[Variable],
         observational_data: Dict[Tuple[Any, ...], float],
     ):
+        """
+        Initializes the Conservative PID inference engine.
+
+        Args:
+            variables: List of Variable objects representing the SCM. Not necessarily ordered.
+            observational_data: Dictionary mapping tuples of variable values to their observational probabilities.
+        """
         self.variables = variables
         self.data = observational_data
 
     def infer(
-        self, query: Query, fixed_order: Optional[List[str]] = None
+        self, query: Union[Query, Expression], fixed_order: Optional[List[str]] = None
     ) -> Tuple[float, float]:
         """
         Computes bounds for a query.
 
         Args:
-            query: The causal query P(gamma | delta).
+            query: A Query or Expression object.
             fixed_order: (Optional) A list of variable names ['X', 'Z', 'Y'] representing
                             the known topological sort. If provided, skips permutation search.
                             NB: this only works with variables names for now.
@@ -98,14 +110,9 @@ class ConservativePID:
         """
         Helper to run the pipeline for a single specific order.
         """
-        # A. Build Basis
         # Note: In production, you might want to cache this if the order repeats
         basis = VectorizedCanonicalBasis(ordered_vars)
-
-        # B. Initialize Solver
         solver = LPSolver(basis, self.data, ordered_vars)
-
-        # C. Solve
         return solver.solve(query)
 
     def _extract_partial_order(self, query: Query) -> nx.DiGraph:
@@ -148,7 +155,7 @@ class ConservativePID:
             if isinstance(val, CounterfactualTerm):
                 self._add_term_constraints(G, val)
 
-    def _validate_inputs(self, query: Query):
+    def _validate_inputs(self, query: Union[Query, Expression]):
         """
         Performs validation on variables, data, and the query.
 
@@ -188,7 +195,7 @@ class ConservativePID:
                 f"Observational probabilities sum to {total_prob}, expected 1.0."
             )
 
-        # 3. Check Query
+        # 3. Check Query or Expression
         known_vars = set(self.variables)
 
         # Helper to check an event
@@ -202,14 +209,23 @@ class ConservativePID:
                 # Recursively check intervention variables
                 self._check_intervention_vars(term, known_vars)
 
-        if not isinstance(query.target, Event):
-            raise TypeError("Query target must be an Event object.")
-        check_event(query.target, "target")
+        def validate_single_query(q: Query):
+            if not isinstance(q.target, Event):
+                raise TypeError("Query target must be an Event object.")
+            check_event(q.target, "target")
 
-        if query.evidence:
-            if not isinstance(query.evidence, Event):
-                raise TypeError("Query evidence must be an Event object.")
-            check_event(query.evidence, "evidence")
+            if q.evidence:
+                if not isinstance(q.evidence, Event):
+                    raise TypeError("Query evidence must be an Event object.")
+                check_event(q.evidence, "evidence")
+
+        if isinstance(query, Expression):
+            for sub_query in query.terms.keys():
+                validate_single_query(sub_query)
+        elif isinstance(query, Query):
+            validate_single_query(query)
+        else:
+            raise TypeError("Input must be a Query or an Expression object.")
 
     def _check_intervention_vars(self, term: CounterfactualTerm, known_vars: set):
         for var, val in term.intervention.items():
@@ -219,3 +235,6 @@ class ConservativePID:
                 )
             if isinstance(val, CounterfactualTerm):
                 self._check_intervention_vars(val, known_vars)
+
+    def __repr__(self):
+        return f"ConservativePID(variables={self.variables}, data={self.data})"
