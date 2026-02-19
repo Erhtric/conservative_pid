@@ -1,5 +1,5 @@
 import itertools
-from typing import Any, Dict, List, Union
+from typing import List, Union
 
 import numpy as np
 from loguru import logger
@@ -24,11 +24,13 @@ class VectorizedCanonicalBasis:
             variables: List of **ordered** variables in the causal model.
         """
         self.variables = variables
-        self.var_to_idx = {var: i for i, var in enumerate(variables)}
+        self.var_to_idx: dict[Variable, int] = {
+            var: i for i, var in enumerate(variables)
+        }
 
         # 1. Map domains to integers
-        self.domain_maps = {}  # {Variable: {val: int_code}}
-        self.inverse_maps = {}  # {Variable: {int_code: val}}
+        self.domain_maps: dict[Variable, dict] = {}  # {Variable: {val: int_code}}
+        self.inverse_maps: dict[Variable, dict] = {}  # {Variable: {int_code: val}}
         for var in variables:
             d_map = {val: i for i, val in enumerate(var.domain)}
             self.domain_maps[var] = d_map
@@ -114,8 +116,8 @@ class VectorizedCanonicalBasis:
     def evaluate(self, term: CounterfactualTerm) -> np.ndarray:
         """
         Evaluates the term in every world.
-        Returns an array of shape (N_worlds,) containing the value of 'term' in every world.
-        In other words, it returns the column of the basis matrix corresponding to 'term'.
+        Returns an array of shape (N_worlds,) containing the value of `term` in every world.
+        In a programmatic way, it returns the column of the matrix corresponding to 'term'.
 
         Args:
             term: The term to evaluate.
@@ -165,8 +167,7 @@ class VectorizedCanonicalBasis:
     def get_mask(self, event: Union[Event]) -> np.ndarray:
         """
         Returns a boolean array (N_worlds,) where True indicates the world satisfies the event.
-        Logic corresponds to Theorems 3.2 (Observational) and 3.3 (Counterfactual) in the paper.
-        omega |- gamma
+        Corresponds to an entailment for the event.
 
         Args:
             event: The event to evaluate.
@@ -174,7 +175,7 @@ class VectorizedCanonicalBasis:
         Returns:
             np.ndarray: A boolean array of shape (N_worlds,) where True indicates the world satisfies the event.
         """
-        mask = np.ones(self.n_worlds, dtype=bool)
+        mask: np.ndarray = np.ones(self.n_worlds, dtype=bool)
 
         for term, val in event.assignments.items():
             # Get values for this term across all worlds

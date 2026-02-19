@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
+import pulp
 from loguru import logger
 
 from solver import LPSolver, VectorizedCanonicalBasis
@@ -21,44 +22,47 @@ class ConservativePID:
     def __init__(
         self,
         variables: List[Variable],
-        observational_data: Dict[Tuple[Any, ...], float],
+        observational_probs: Dict[Tuple[Any, ...], float],
     ):
         """
         Initializes the Conservative PID inference engine.
 
         Args:
             variables: List of Variable objects representing the SCM. Not necessarily ordered.
-            observational_data: Dictionary mapping tuples of variable values to their observational probabilities.
+            observational_probs: Dictionary mapping tuples of variable values to their observational probabilities.
         """
-        self.variables = variables
-        self.data = observational_data
+        self.variables: list[Variable] = variables
+        self.observational_probs: dict[tuple[Any, ...], int | float] = (
+            observational_probs
+        )
 
     def infer(
         self,
         query: Union[Query, Expression],
-        fixed_order: Optional[List[str]] = None,
+        causal_order: Optional[List[str]] = None,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
         """
-        Computes bounds for a query.
+        Computes bounds for a query or expression.
 
         Args:
             query: A Query or Expression object.
-            fixed_order: (Optional) A list of variable names ['X', 'Z', 'Y'] representing
-                            the known topological sort. If provided, skips permutation search.
+            causal_order: (Optional) A list of variable names, e.g. ['X', 'Z', 'Y'], representing
+                            the known topological order. If provided, skips permutation search.
                             NB: this only works with variables names for now.
             monotonic: If True, enforces monotonicity on all variables.
                        If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
-            Tuple[float, float]: The lower and upper bounds for the query.
+            A tuple containing the solved LP problems for the lower and upper bounds, and their optimal values.
         """
         self._validate_inputs(query)
+        logger.success("Input validation passed.")
 
-        if fixed_order:
-            logger.info(f"Using fixed causal order: {fixed_order}")
+        if causal_order:
+            logger.info(f"Using fixed causal order: {causal_order}")
 
-            if set(fixed_order) != set(v.name for v in self.variables):
+            if set(causal_order) != set(v.name for v in self.variables):
                 raise ValueError(
                     "Fixed order must contain exactly all defined variables."
                 )
@@ -66,7 +70,7 @@ class ConservativePID:
             # Convert names to Variable objects
             # TODO: add the possibility pass a list of Variable objects instead of names
             var_map = {v.name: v for v in self.variables}
-            ordered_vars = [var_map[name] for name in fixed_order]
+            ordered_vars = [var_map[name] for name in causal_order]
 
             # TODO: check if the fixed order allows the query
 
@@ -74,7 +78,7 @@ class ConservativePID:
 
         # NO ORDER KNOWN
         # 1. Extract Partial Order from Query
-        partial_order = self._extract_partial_order(query)
+        partial_order: nx.DiGraph = self._extract_partial_order(query)
 
         # 2. Generate Linear Extensions
         try:
@@ -93,34 +97,39 @@ class ConservativePID:
 
         # 3. Iterate and Aggregate
         for i, order_names in enumerate(valid_orders):
-            var_map = {v.name: v for v in self.variables}
-            ordered_vars = [var_map[name] for name in order_names]
+            var_map: dict[str, Variable] = {v.name: v for v in self.variables}
+            ordered_vars: list[Variable] = [var_map[name] for name in order_names]
 
-            logger.info(f"Processing Order {i + 1}/{len(valid_orders)}: {order_names}")
-
-            lb, ub = self._solve_for_order(ordered_vars, query, monotonic=monotonic)
+            (lb_prob, ub_prob), (lb, ub) = self._solve_for_order(
+                ordered_vars, query, monotonic=monotonic
+            )
 
             # Update Global Bounds (Algorithm 2: min of LBs, max of UBs)
             if not np.isnan(lb):
                 global_lb = min(global_lb, lb)
+                global_lb_prob = lb_prob
             if not np.isnan(ub):
                 global_ub = max(global_ub, ub)
+                global_ub_prob = ub_prob
 
-        return global_lb, global_ub
+        return (global_lb_prob, global_ub_prob), (global_lb, global_ub)
 
     def _solve_for_order(
         self,
         ordered_vars: List[Variable],
-        query: Query,
+        query: Query | Expression,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
         """
         Helper to run the pipeline for a single specific order.
         """
-        # Note: In production, you might want to cache this if the order repeats
+        logger.debug(
+            f"Solving for order: {[v.name for v in ordered_vars]} with monotonic={monotonic}"
+        )
         basis = VectorizedCanonicalBasis(ordered_vars)
-        solver = LPSolver(basis, self.data, ordered_vars)
-        return solver.solve(query, monotonic=monotonic)
+        solver = LPSolver(basis, self.observational_probs, ordered_vars)
+        (lb_prob, ub_prob), (lb, ub) = solver.solve(query, monotonic=monotonic)
+        return (lb_prob, ub_prob), (lb, ub)
 
     def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
         """
@@ -184,7 +193,7 @@ class ConservativePID:
         expected_len = len(self.variables)
         total_prob = 0.0
 
-        for row, prob in self.data.items():
+        for row, prob in self.observational_probs.items():
             if len(row) != expected_len:
                 raise ValueError(
                     f"Data row {row} has length {len(row)}, expected {expected_len} (variables: {[v.name for v in self.variables]})."
@@ -282,4 +291,4 @@ class ConservativePID:
         return new_data
 
     def __repr__(self):
-        return f"ConservativePID(variables={self.variables}, data={self.data})"
+        return f"ConservativePID(variables={self.variables}, data={self.observational_probs})"

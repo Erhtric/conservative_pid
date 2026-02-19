@@ -114,6 +114,20 @@ class Event:
 
     assignments: dict[CounterfactualTerm, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        normalized: dict[CounterfactualTerm, Any] = {}
+        for term, value in self.assignments.items():
+            if isinstance(term, Variable):
+                normalized[CounterfactualTerm(term, {})] = value
+                continue
+            if isinstance(term, CounterfactualTerm):
+                normalized[term] = value
+                continue
+            raise TypeError(
+                "Event assignments must use Variable or CounterfactualTerm keys."
+            )
+        object.__setattr__(self, "assignments", normalized)
+
     def expand(self) -> List[Event]:
         """
         Applies the Counterfactual Unnesting Theorem (CUT) once.

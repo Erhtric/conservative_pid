@@ -1,21 +1,17 @@
-"""
-Translates the Canonical Representation into a Linear Program using PuLP.
-"""
-
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pulp
 
-from src.canonical import VectorizedCanonicalBasis
-from src.symbolic import CounterfactualTerm, Event, Expression, Query, Variable
+from canonical import VectorizedCanonicalBasis
+from symbolic import CounterfactualTerm, Event, Expression, Query, Variable
 
 
 class LPSolver:
     def __init__(
         self,
         basis: VectorizedCanonicalBasis,
-        observational_data: Dict[Tuple[Any, ...], float],
+        observational_probs: Dict[Tuple[Any, ...], float],
         variables: List[Variable],
         verbose: bool = False,
     ):
@@ -32,8 +28,8 @@ class LPSolver:
         Raises:
             ValueError: If the observational data is inconsistent with the causal order.
         """
-        self.basis = basis
-        self.data = observational_data
+        self.basis: VectorizedCanonicalBasis = basis
+        self.obs_probs = observational_probs
         self.variables = variables
         self.verbose = verbose
         self.data_compatibility_map = self._build_data_compatibility_map()
@@ -44,7 +40,7 @@ class LPSolver:
         It is the equivalent of checking the consistency of the observational data with the causal order.
         """
         compatibility = {}
-        for joint_assignment in self.data.keys():
+        for joint_assignment in self.obs_probs.keys():
             # Convert tuple observation to Event object
             obs_event = Event(
                 {
@@ -62,7 +58,7 @@ class LPSolver:
         self,
         query: Union[Query, Expression],
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
         """
         Computes the Lower and Upper bounds for the given query or expression.
 
@@ -72,12 +68,14 @@ class LPSolver:
                        If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
-            A tuple containing the lower and upper bounds.
+            A tuple containing the solved LP problems for the lower and upper bounds, and their optimal values.
         """
-        # Ensure we are working with an Expression (a collection of atomic queries)
+        # NB: all the queries become expressions after expansion, so we can handle them in a unified way.
+        # TODO: could we write everything in terms of Expressions from the start and avoid this check? The main reason to keep Query is for user-friendly syntax, but maybe we can have Query be a thin wrapper around Expression that just handles the initial parsing and expansion.
+
         if isinstance(query, Query):
             expression = query.expand()
-        else:
+        elif isinstance(query, Expression):
             # If the user passes an Expression directly, we assume it might
             # still contain unexpanded queries, so we expand each term.
             new_terms = {}
@@ -86,6 +84,8 @@ class LPSolver:
                 for sub_q, sub_w in expanded_sub.terms.items():
                     new_terms[sub_q] = new_terms.get(sub_q, 0.0) + sub_w * w
             expression = Expression(new_terms)
+        else:
+            raise TypeError("Input must be a Query or an Expression.")
 
         # Check for evidence consistency (all sub-queries must share the same evidence)
         if not expression.terms:
@@ -103,22 +103,22 @@ class LPSolver:
 
         # If evidence is present, use Charnes-Cooper transformation for P(gamma | delta)
         if first_evidence:
-            _, lb = self._solve_linear_fractional(
+            lb_prob, lb = self._solve_linear_fractional(
                 expression, first_evidence, sense=pulp.LpMinimize, monotonic=monotonic
             )
-            _, ub = self._solve_linear_fractional(
+            ub_prob, ub = self._solve_linear_fractional(
                 expression, first_evidence, sense=pulp.LpMaximize, monotonic=monotonic
             )
         else:
             # If no evidence, solve standard LP
-            _, lb = self._solve_standard_lp(
+            lb_prob, lb = self._solve_standard_lp(
                 expression, sense=pulp.LpMinimize, monotonic=monotonic
             )
-            _, ub = self._solve_standard_lp(
+            ub_prob, ub = self._solve_standard_lp(
                 expression, sense=pulp.LpMaximize, monotonic=monotonic
             )
 
-        return lb, ub
+        return (lb_prob, ub_prob), (lb, ub)
 
     def _get_monotonicity_mask(
         self, monotonic: Union[bool, List[Variable]]
@@ -176,11 +176,9 @@ class LPSolver:
         expression: Expression,
         sense: int,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[pulp.LpStatus, float]:
+    ) -> Tuple[pulp.LpProblem, float]:
         """
-        Implements Algorithm 1 (Def 3.4).
-        Min/Max sum(q_omega) subject to observational constraints.
-        Extended to handle Expressions.
+        Implements standard LP over the sigma signature.
 
         Args:
             expression: The query or expression to solve.
@@ -188,7 +186,7 @@ class LPSolver:
             monotonic: If True, enforce monotonicity.
 
         Returns:
-            The lower and upper bounds.
+            A tuple containing the solved LP problem and the optimal value.
         """
         # 1. Define the Problem
         prob = pulp.LpProblem("Counterfactual_Bounding", sense)
@@ -216,7 +214,7 @@ class LPSolver:
 
         # B. Observational Consistency: sum(q where omega |= v) = P(v)
         # Theorem 3.2
-        for row, prob_val in self.data.items():
+        for row, prob_val in self.obs_probs.items():
             compatible_indices = self.data_compatibility_map[row]
             if not compatible_indices:
                 # If data has probability > 0 but no world can generate it, the model is invalid.
@@ -253,16 +251,15 @@ class LPSolver:
         evidence: Event,
         sense: int,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[pulp.LpStatus, float]:
+    ) -> Tuple[pulp.LpProblem, float]:
         """
         Implements Charnes-Cooper transformation for Conditional Queries.
-        Section 5.1 [cite: 231-235].
         """
         prob = pulp.LpProblem("Conditional_Bounding", sense)
 
         # 1. Transformed Variables
         # q_prime corresponds to q_omega * t
-        q_prime_vars = [
+        q_prime_vars: list[pulp.LpVariable] = [
             pulp.LpVariable(f"q_prime_{i}", lowBound=0)
             for i in range(self.basis.n_worlds)
         ]
@@ -303,7 +300,7 @@ class LPSolver:
         prob += pulp.lpSum(q_prime_vars) == t, "Sum_t"
 
         # C. Observational Constraints Transformed: sum(q_prime) = P(v) * t
-        for row, prob_val in self.data.items():
+        for row, prob_val in self.obs_probs.items():
             compatible_indices = self.data_compatibility_map[row]
             if compatible_indices:
                 # LHS: sum of transformed vars
