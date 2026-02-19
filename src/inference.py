@@ -3,8 +3,7 @@ High-level entry point for inference.
 Partial order extraction, permutation generation, bound aggregation
 """
 
-from ctypes import Union
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
@@ -35,7 +34,10 @@ class ConservativePID:
         self.data = observational_data
 
     def infer(
-        self, query: Union[Query, Expression], fixed_order: Optional[List[str]] = None
+        self,
+        query: Union[Query, Expression],
+        fixed_order: Optional[List[str]] = None,
+        monotonic: Union[bool, List[Variable]] = False,
     ) -> Tuple[float, float]:
         """
         Computes bounds for a query.
@@ -45,6 +47,8 @@ class ConservativePID:
             fixed_order: (Optional) A list of variable names ['X', 'Z', 'Y'] representing
                             the known topological sort. If provided, skips permutation search.
                             NB: this only works with variables names for now.
+            monotonic: If True, enforces monotonicity on all variables.
+                       If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
             Tuple[float, float]: The lower and upper bounds for the query.
@@ -66,7 +70,7 @@ class ConservativePID:
 
             # TODO: check if the fixed order allows the query
 
-            return self._solve_for_order(ordered_vars, query)
+            return self._solve_for_order(ordered_vars, query, monotonic=monotonic)
 
         # NO ORDER KNOWN
         # 1. Extract Partial Order from Query
@@ -94,7 +98,7 @@ class ConservativePID:
 
             logger.info(f"Processing Order {i + 1}/{len(valid_orders)}: {order_names}")
 
-            lb, ub = self._solve_for_order(ordered_vars, query)
+            lb, ub = self._solve_for_order(ordered_vars, query, monotonic=monotonic)
 
             # Update Global Bounds (Algorithm 2: min of LBs, max of UBs)
             if not np.isnan(lb):
@@ -105,7 +109,10 @@ class ConservativePID:
         return global_lb, global_ub
 
     def _solve_for_order(
-        self, ordered_vars: List[Variable], query: Query
+        self,
+        ordered_vars: List[Variable],
+        query: Query,
+        monotonic: Union[bool, List[Variable]] = False,
     ) -> Tuple[float, float]:
         """
         Helper to run the pipeline for a single specific order.
@@ -113,7 +120,7 @@ class ConservativePID:
         # Note: In production, you might want to cache this if the order repeats
         basis = VectorizedCanonicalBasis(ordered_vars)
         solver = LPSolver(basis, self.data, ordered_vars)
-        return solver.solve(query)
+        return solver.solve(query, monotonic=monotonic)
 
     def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
         """
@@ -241,6 +248,38 @@ class ConservativePID:
                 )
             if isinstance(val, CounterfactualTerm):
                 self._check_intervention_vars(val, known_vars)
+
+    @staticmethod
+    def marginalize_data(
+        data: Dict[Tuple[Any, ...], float],
+        all_variables: List[Variable],
+        target_variables: List[Variable],
+    ) -> Dict[Tuple[Any, ...], float]:
+        """
+        Marginalizes the observational data to the subset of target variables.
+
+        Args:
+            data: The full observational data dictionary.
+            all_variables: The list of variables corresponding to the full data tuples.
+            target_variables: The subset of variables to keep.
+
+        Returns:
+            A new data dictionary with keys corresponding to target_variables and aggregated probabilities.
+        """
+        if not set(target_variables).issubset(set(all_variables)):
+            raise ValueError("Target variables must be a subset of all variables.")
+
+        # Find indices of target variables in the original list
+        indices = [all_variables.index(var) for var in target_variables]
+
+        new_data = {}
+
+        for full_tuple, prob in data.items():
+            # Extract sub-tuple
+            sub_tuple = tuple(full_tuple[i] for i in indices)
+            new_data[sub_tuple] = new_data.get(sub_tuple, 0.0) + prob
+
+        return new_data
 
     def __repr__(self):
         return f"ConservativePID(variables={self.variables}, data={self.data})"

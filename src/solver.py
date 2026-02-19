@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pulp
 
-from canonical import VectorizedCanonicalBasis
-from symbolic import CounterfactualTerm, Event, Expression, Query, Variable
+from src.canonical import VectorizedCanonicalBasis
+from src.symbolic import CounterfactualTerm, Event, Expression, Query, Variable
 
 
 class LPSolver:
@@ -58,12 +58,18 @@ class LPSolver:
             ].tolist()
         return compatibility
 
-    def solve(self, query: Union[Query, Expression]) -> Tuple[float, float]:
+    def solve(
+        self,
+        query: Union[Query, Expression],
+        monotonic: Union[bool, List[Variable]] = False,
+    ) -> Tuple[float, float]:
         """
         Computes the Lower and Upper bounds for the given query or expression.
 
         Args:
             query: The query or expression to solve.
+            monotonic: If True, enforces monotonicity constraints (response functions must be non-decreasing) on all variables.
+                       If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
             A tuple containing the lower and upper bounds.
@@ -98,20 +104,78 @@ class LPSolver:
         # If evidence is present, use Charnes-Cooper transformation for P(gamma | delta)
         if first_evidence:
             _, lb = self._solve_linear_fractional(
-                expression, first_evidence, sense=pulp.LpMinimize
+                expression, first_evidence, sense=pulp.LpMinimize, monotonic=monotonic
             )
             _, ub = self._solve_linear_fractional(
-                expression, first_evidence, sense=pulp.LpMaximize
+                expression, first_evidence, sense=pulp.LpMaximize, monotonic=monotonic
             )
         else:
             # If no evidence, solve standard LP
-            _, lb = self._solve_standard_lp(expression, sense=pulp.LpMinimize)
-            _, ub = self._solve_standard_lp(expression, sense=pulp.LpMaximize)
+            _, lb = self._solve_standard_lp(
+                expression, sense=pulp.LpMinimize, monotonic=monotonic
+            )
+            _, ub = self._solve_standard_lp(
+                expression, sense=pulp.LpMaximize, monotonic=monotonic
+            )
 
         return lb, ub
 
+    def _get_monotonicity_mask(
+        self, monotonic: Union[bool, List[Variable]]
+    ) -> np.ndarray:
+        """
+        Identifies worlds where the response functions are monotonic (non-decreasing)
+        with respect to their parents.
+
+        Args:
+            monotonic: Boolean or list of variables to check.
+
+        Returns:
+            A boolean array (N_worlds,) where True indicates the world satisfies monotonicity.
+        """
+        valid_worlds_mask = np.ones(self.basis.n_worlds, dtype=bool)
+
+        # Determine which variables to check
+        if monotonic is True:
+            vars_to_check = set(self.basis.variables)
+        elif monotonic is False or monotonic is None:
+            return valid_worlds_mask  # All valid (no constraints)
+        else:
+            vars_to_check = set(monotonic)
+
+        for i, var in enumerate(self.basis.variables):
+            if var not in vars_to_check:
+                continue
+
+            parents = self.basis.variables[:i]
+            if not parents:
+                continue
+
+            strides = self.basis.parent_strides[i]
+            table = self.basis.func_tables[i]  # (N_worlds, N_configs)
+            n_configs = table.shape[1]
+
+            for p_idx, parent in enumerate(parents):
+                stride = strides[p_idx]
+                dom_size = len(parent.domain)
+
+                for col in range(n_configs):
+                    # Check if parent value can be incremented
+                    val_p = (col // stride) % dom_size
+                    if val_p < dom_size - 1:
+                        col_next = col + stride
+                        # Monotonicity: f(x) <= f(x') when x <= x'
+                        # So we require table[col] <= table[col_next]
+                        # Invalid if table[col] > table[col_next]
+                        valid_worlds_mask &= table[:, col] <= table[:, col_next]
+
+        return valid_worlds_mask
+
     def _solve_standard_lp(
-        self, expression: Expression, sense
+        self,
+        expression: Expression,
+        sense: int,
+        monotonic: Union[bool, List[Variable]] = False,
     ) -> Tuple[pulp.LpStatus, float]:
         """
         Implements Algorithm 1 (Def 3.4).
@@ -119,8 +183,9 @@ class LPSolver:
         Extended to handle Expressions.
 
         Args:
-            query: The query or expression to solve.
+            expression: The query or expression to solve.
             sense: pulp.LpMinimize or pulp.LpMaximize.
+            monotonic: If True, enforce monotonicity.
 
         Returns:
             The lower and upper bounds.
@@ -166,6 +231,14 @@ class LPSolver:
                 f"Obs_{row}",
             )
 
+        # C. Monotonicity Constraints
+        if monotonic:
+            valid_mask = self._get_monotonicity_mask(monotonic)
+            points_to_zero = np.where(~valid_mask)[0]
+            for i in points_to_zero:
+                # Enforce q_i = 0 for non-monotonic worlds
+                prob += q_vars[i] == 0, f"Monotonicity_Exclusion_{i}"
+
         # 5. Solve
         prob.solve(pulp.PULP_CBC_CMD(msg=self.verbose))
 
@@ -175,7 +248,11 @@ class LPSolver:
         return prob, pulp.value(prob.objective)
 
     def _solve_linear_fractional(
-        self, expression: Expression, evidence: Event, sense
+        self,
+        expression: Expression,
+        evidence: Event,
+        sense: int,
+        monotonic: Union[bool, List[Variable]] = False,
     ) -> Tuple[pulp.LpStatus, float]:
         """
         Implements Charnes-Cooper transformation for Conditional Queries.
@@ -233,6 +310,14 @@ class LPSolver:
                 lhs = pulp.lpSum([q_prime_vars[i] for i in compatible_indices])
                 # RHS: prob_val * t
                 prob += lhs == prob_val * t, f"Obs_Transformed_{row}"
+
+        # D. Monotonicity Constraints
+        if monotonic:
+            valid_mask = self._get_monotonicity_mask(monotonic)
+            points_to_zero = np.where(~valid_mask)[0]
+            for i in points_to_zero:
+                # In Charnes-Cooper, q_i = 0 implies q_prime_i = 0 (since t >= 0)
+                prob += q_prime_vars[i] == 0, f"Monotonicity_Exclusion_Prime_{i}"
 
         # 4. Solve
         prob.solve(pulp.PULP_CBC_CMD(msg=False))

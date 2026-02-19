@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Union
 import numpy as np
 from loguru import logger
 
-from symbolic import CounterfactualTerm, Event, Variable
+from src.symbolic import CounterfactualTerm, Event, Variable
 
 
 class VectorizedCanonicalBasis:

@@ -1,6 +1,8 @@
 import pytest
+import sys
 
-from symbolic import CounterfactualTerm, Event, Expression, P, Query, Variable
+sys.path.append("../src/")
+from src.symbolic import CounterfactualTerm, Event, Expression, P, Query, Variable
 
 
 def test_variable_equality():
@@ -38,6 +40,7 @@ def test_variable_dsl_event():
 
 
 def test_matmul_syntax():
+    "Subscript functional specifications as syntax sugar"
     X = Variable("X")
     Y = Variable("Y")
 

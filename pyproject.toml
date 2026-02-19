@@ -18,10 +18,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "marker-pdf>=1.10.2",
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.7.1",
     "mkdocstrings[python]>=1.0.2",
-    "pyrefly>=0.49.0",
     "pytest>=9.0.2",
 ]
 

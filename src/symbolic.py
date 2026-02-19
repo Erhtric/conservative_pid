@@ -1,6 +1,6 @@
 """
-Defines the symbolic language for causal inference: Variables, Interventions,
-Counterfactual Terms, Events, Queries
+Defines the DSL for Causal Inference: Variables, Interventions,
+Counterfactual Terms, Events and Queries
 """
 
 from __future__ import annotations
@@ -112,20 +112,15 @@ class Event:
     Stored as a dictionary mapping counterfactual terms to their values.
     """
 
-    assignments: OrderedDict[CounterfactualTerm, Any] = field(default_factory=dict)
+    assignments: dict[CounterfactualTerm, Any] = field(default_factory=dict)
 
     def expand(self) -> List[Event]:
         """
         Applies the Counterfactual Unnesting Theorem (CUT) once.
 
-        TODO: Make this recursive. We can at the end call expand when extending the list of events.
-
         Example:
         Input: (Y_{X_z}=y)
         Output: [{Y_{X=0}=y & X_z=0}, {Y_{X=1}=y & X_z=1}, ...]
-
-        Args:
-            None
 
         Returns:
             A list of events
@@ -179,12 +174,6 @@ class Event:
                 {new_outer_term: self.assignments[outer_term], new_inner_term: val}
             )
 
-            # Check for conflict, if the inner term is already assigned a different value, raise an error
-            # if inner_term in self.assignments and self.assignments[inner_term] != val:
-            #     raise ValueError(
-            #         f"Contradictory assignments. {inner_term} cannot be both {self.assignments[inner_term]} and {val}"
-            #     )
-
             # Add the new event to the list of expanded events
             expanded_events.append(conjunction)
 
@@ -206,13 +195,6 @@ class Event:
             new_assigments[term] = value
 
         return Event(new_assigments)
-
-    # def __or__(self, other: Event) -> Event:
-    #     """
-    #     Syntax sugar for creating a disjunction of events.
-    #     Usage: event1 | event2
-    #     """
-    #     return Event({**self.assignments, **other.assignments})
 
     def __repr__(self):
         # Sort by the string representation of the term for stability

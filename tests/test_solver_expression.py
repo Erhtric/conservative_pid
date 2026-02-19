@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from canonical import VectorizedCanonicalBasis
-from solver import LPSolver
-from symbolic import CounterfactualTerm, Event, P, Variable
+from src.canonical import VectorizedCanonicalBasis
+from src.solver import LPSolver
+from src.symbolic import Event, P, Variable
 
 
 def test_solver_expression_basic():
@@ -20,8 +20,10 @@ def test_solver_expression_basic():
     solver = LPSolver(basis, data, [X, Y])
 
     # Expression: P(Y=0) + P(Y=1). Should be 1.0
-    q1 = P(Y == 0)
-    q2 = P(Y == 1)
+    ev1 = Event({Y: 0})
+    ev2 = Event({Y: 1})
+    q1 = P(ev1)
+    q2 = P(ev2)
     expr = q1 + q2
 
     lb, ub = solver.solve(expr)
