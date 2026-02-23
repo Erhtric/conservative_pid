@@ -1,4 +1,4 @@
 
 # Symbolic Module
 
-::: symbolic
+::: src.symbolic

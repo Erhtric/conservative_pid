@@ -22,17 +22,17 @@ class ConservativePID:
     def __init__(
         self,
         variables: List[Variable],
-        observational_probs: Dict[Tuple[Any, ...], float],
+        observational_probs: Dict[Tuple[Tuple[str, Any], ...], float],
     ):
         """
         Initializes the Conservative PID inference engine.
 
         Args:
             variables: List of Variable objects representing the SCM. Not necessarily ordered.
-            observational_probs: Dictionary mapping tuples of variable values to their observational probabilities.
+            observational_probs: Dictionary mapping tuples of variable (Name, value) to their observational probabilities.
         """
         self.variables: list[Variable] = variables
-        self.observational_probs: dict[tuple[Any, ...], int | float] = (
+        self.observational_probs: dict[tuple[tuple[str, Any], ...], int | float] = (
             observational_probs
         )
 
@@ -41,7 +41,7 @@ class ConservativePID:
         query: Union[Query, Expression],
         causal_order: Optional[List[str]] = None,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
+    ) -> Tuple[float, float]:
         """
         Computes bounds for a query or expression.
 
@@ -54,7 +54,7 @@ class ConservativePID:
                        If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
-            A tuple containing the solved LP problems for the lower and upper bounds, and their optimal values.
+            A tuple containing the lower and upper bounds (lb, ub).
         """
         self._validate_inputs(query)
         logger.success("Input validation passed.")
@@ -100,26 +100,22 @@ class ConservativePID:
             var_map: dict[str, Variable] = {v.name: v for v in self.variables}
             ordered_vars: list[Variable] = [var_map[name] for name in order_names]
 
-            (lb_prob, ub_prob), (lb, ub) = self._solve_for_order(
-                ordered_vars, query, monotonic=monotonic
-            )
+            lb, ub = self._solve_for_order(ordered_vars, query, monotonic=monotonic)
 
             # Update Global Bounds (Algorithm 2: min of LBs, max of UBs)
             if not np.isnan(lb):
                 global_lb = min(global_lb, lb)
-                global_lb_prob = lb_prob
             if not np.isnan(ub):
                 global_ub = max(global_ub, ub)
-                global_ub_prob = ub_prob
 
-        return (global_lb_prob, global_ub_prob), (global_lb, global_ub)
+        return global_lb, global_ub
 
     def _solve_for_order(
         self,
         ordered_vars: List[Variable],
         query: Query | Expression,
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
+    ) -> Tuple[float, float]:
         """
         Helper to run the pipeline for a single specific order.
         """
@@ -128,8 +124,8 @@ class ConservativePID:
         )
         basis = VectorizedCanonicalBasis(ordered_vars)
         solver = LPSolver(basis, self.observational_probs, ordered_vars)
-        (lb_prob, ub_prob), (lb, ub) = solver.solve(query, monotonic=monotonic)
-        return (lb_prob, ub_prob), (lb, ub)
+        lb, ub = solver.solve(query, monotonic=monotonic)
+        return lb, ub
 
     def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
         """

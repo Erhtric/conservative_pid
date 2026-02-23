@@ -1,4 +1,4 @@
 
 # Canonical Module
 
-::: canonical
+::: src.canonical

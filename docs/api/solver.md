@@ -1,4 +1,4 @@
 
 # Solver Module
 
-::: solver
+::: src.solver

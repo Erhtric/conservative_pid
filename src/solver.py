@@ -58,7 +58,7 @@ class LPSolver:
         self,
         query: Union[Query, Expression],
         monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[Tuple[pulp.LpProblem, pulp.LpProblem], Tuple[float, float]]:
+    ) -> Tuple[float, float]:
         """
         Computes the Lower and Upper bounds for the given query or expression.
 
@@ -68,7 +68,7 @@ class LPSolver:
                        If a list of Variables, enforces monotonicity only on those variables.
 
         Returns:
-            A tuple containing the solved LP problems for the lower and upper bounds, and their optimal values.
+            A tuple containing the lower and upper bounds (lb, ub).
         """
         # NB: all the queries become expressions after expansion, so we can handle them in a unified way.
         # TODO: could we write everything in terms of Expressions from the start and avoid this check? The main reason to keep Query is for user-friendly syntax, but maybe we can have Query be a thin wrapper around Expression that just handles the initial parsing and expansion.
@@ -103,22 +103,22 @@ class LPSolver:
 
         # If evidence is present, use Charnes-Cooper transformation for P(gamma | delta)
         if first_evidence:
-            lb_prob, lb = self._solve_linear_fractional(
+            _, lb = self._solve_linear_fractional(
                 expression, first_evidence, sense=pulp.LpMinimize, monotonic=monotonic
             )
-            ub_prob, ub = self._solve_linear_fractional(
+            _, ub = self._solve_linear_fractional(
                 expression, first_evidence, sense=pulp.LpMaximize, monotonic=monotonic
             )
         else:
             # If no evidence, solve standard LP
-            lb_prob, lb = self._solve_standard_lp(
+            _, lb = self._solve_standard_lp(
                 expression, sense=pulp.LpMinimize, monotonic=monotonic
             )
-            ub_prob, ub = self._solve_standard_lp(
+            _, ub = self._solve_standard_lp(
                 expression, sense=pulp.LpMaximize, monotonic=monotonic
             )
 
-        return (lb_prob, ub_prob), (lb, ub)
+        return lb, ub
 
     def _get_monotonicity_mask(
         self, monotonic: Union[bool, List[Variable]]
