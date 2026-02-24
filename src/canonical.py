@@ -159,7 +159,7 @@ class VectorizedCanonicalBasis:
             constraints: A list of MonotonicityConstraint objects.
         """
         if not constraints:
-            return
+            return np.array([], dtype=int)  # No constraints, no worlds removed
 
         valid_mask = np.ones(self.n_worlds, dtype=bool)
 

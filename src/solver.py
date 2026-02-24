@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pulp
@@ -14,16 +14,18 @@ class LPSolver:
         basis: VectorizedCanonicalBasis,
         observational_probs: pd.DataFrame,
         variables: List[Variable],
+        experimental_probs: Optional[pd.DataFrame] = None,
         verbose: bool = False,
     ):
         """
-        Initializes the solver with the pre-computed canonical basis and observational data.
+        Initializes the solver with the pre-computed canonical basis and observational/experimental data.
 
         Args:
             basis: The list of all deterministic worlds (Omega).
             observational_probs: A pandas DataFrame with columns corresponding to variable names and a 'probability' column.
                                 e.g., DataFrame with columns ['X', 'Y', 'probability'].
-            variables: The list of variables corresponding to the data tuples.
+            variables: The list of variables corresponding to the data tuples (ordered by causal order).
+            experimental_probs: Optional DataFrame with interventional data. May have a subset of variables (marginalization performed).
             verbose: Whether to print verbose output.
 
         Raises:
@@ -31,31 +33,89 @@ class LPSolver:
         """
         self.basis: VectorizedCanonicalBasis = basis
         self.obs_probs = observational_probs
+        self.exp_probs = experimental_probs
         self.variables = variables
         self.verbose = verbose
-        self.data_compatibility_map = self._build_data_compatibility_map()
+        self.obs_compatibility_map = self._build_compatibility_map(
+            self.obs_probs, "observational"
+        )
+        self.exp_compatibility_map = (
+            self._build_compatibility_map(self.exp_probs, "experimental")
+            if self.exp_probs is not None
+            else None
+        )
 
-    def _build_data_compatibility_map(self) -> Dict[Tuple[Any, ...], List[int]]:
+    def _build_compatibility_map(
+        self, data: pd.DataFrame, data_type: str = "observational"
+    ) -> Dict[Tuple[Any, ...], List[int]]:
         """
-        Builds a map from each observation to the list of compatible worlds.
-        It is the equivalent of checking the consistency of the observational data with the causal order.
+        Builds a map from each data row to the list of compatible worlds.
+
+        Handles BOTH observational and experimental data:
+        - Observational: All variables in `self.variables` must be present.
+        - Experimental: A subset of variables is allowed; marginalization is implicit in the LP.
+
+        Args:
+            data: The probability DataFrame to map.
+            data_type: Either "observational" or "experimental" for logging context.
+
+        Returns:
+            Dictionary mapping tuples of observed values (for present variables) to world indices.
+
+        Raises:
+            ValueError: If observational data has missing variables or impossible assignments.
         """
-        compatibility = {}
+        compatibility: Dict[Tuple[Any, ...], List[int]] = {}
 
-        obs_vars = [v for v in self.variables if v.name in self.obs_probs.columns]
+        # Determine which variables are present in the data
+        data_vars = [v for v in self.variables if v.name in data.columns]
 
-        for _, row in self.obs_probs.iterrows():
-            joint_assignment = tuple(row[v.name] for v in obs_vars)
+        if data_type == "observational":
+            # Strict: all variables must be in observational data
+            missing_vars = [
+                v.name for v in self.variables if v.name not in data.columns
+            ]
+            if missing_vars:
+                raise ValueError(
+                    f"Observational data is missing variables {missing_vars}. "
+                    f"All variables in causal order must be present in observational data."
+                )
+
+        for _, row in data.iterrows():
+            # Extract only the values for variables present in this data
+            joint_assignment = tuple(row[v.name] for v in data_vars)
+
+            # Build the event: only for variables in data_vars
             obs_event = Event(
                 {
                     CounterfactualTerm(var, {}): val
-                    for var, val in zip(obs_vars, joint_assignment)
+                    for var, val in zip(data_vars, joint_assignment)
                 }
             )
 
-            compatibility[joint_assignment] = np.where(self.basis.get_mask(obs_event))[
-                0
-            ].tolist()
+            # Get world indices where the event holds
+            compatible_indices = np.where(self.basis.get_mask(obs_event))[0].tolist()
+
+            if data_type == "observational" and not compatible_indices:
+                prob_val = row.get("probability", None)
+                if prob_val and prob_val > 0:
+                    raise ValueError(
+                        f"Data row {dict(row)} is impossible under the current causal order."
+                    )
+                continue
+            elif data_type == "experimental" and not compatible_indices:
+                # Log but do not error for experimental data (it may be strictly narrower than canonical basis)
+                from loguru import logger
+
+                prob_val = row.get("probability", None)
+                logger.warning(
+                    f"Experimental data row {dict(row)} has zero compatible worlds. "
+                    f"Probability {prob_val} will contribute no constraint."
+                )
+                continue
+
+            compatibility[joint_assignment] = compatible_indices
+
         return compatibility
 
     def solve(
@@ -138,7 +198,7 @@ class LPSolver:
         prob = pulp.LpProblem("Counterfactual_Bounding", sense)
 
         # 2. Decision Variables
-        q_vars = [
+        q_vars: list[pulp.LpVariable] = [
             pulp.LpVariable(f"q_{i}", lowBound=0) for i in range(self.basis.n_worlds)
         ]
 
@@ -162,7 +222,7 @@ class LPSolver:
         for _, row in self.obs_probs.iterrows():
             joint_assignment = tuple(row[v.name] for v in obs_vars)
             prob_val = row["probability"]
-            compatible_indices = self.data_compatibility_map[joint_assignment]
+            compatible_indices = self.obs_compatibility_map[joint_assignment]
             if not compatible_indices:
                 if prob_val > 0:
                     raise ValueError(
@@ -235,7 +295,7 @@ class LPSolver:
         for _, row in self.obs_probs.iterrows():
             joint_assignment = tuple(row[v.name] for v in obs_vars)
             prob_val = row["probability"]
-            compatible_indices = self.data_compatibility_map[joint_assignment]
+            compatible_indices = self.obs_compatibility_map[joint_assignment]
             if compatible_indices:
                 lhs = pulp.lpSum([q_prime_vars[i] for i in compatible_indices])
                 prob += lhs == prob_val * t, f"Obs_Transformed_{row}"

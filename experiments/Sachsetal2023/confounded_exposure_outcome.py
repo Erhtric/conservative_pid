@@ -4,7 +4,7 @@ import pandas as pd
 import time
 from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.factors.discrete import TabularCPD
-from pgmpy.inference import VariableElimination
+from pgmpy.sampling.Sampling import BayesianModelSampling
 
 repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
@@ -67,17 +67,12 @@ cpd_y = TabularCPD(
 )
 
 model.add_cpds(cpd_u, cpd_x, cpd_y)
-ie = VariableElimination(model)
+counts = BayesianModelSampling(model).forward_sample(size=10000, seed=42)
 # %%
-joint_xy = ie.query(variables=["X", "Y"], joint=True)
 
-obs_data_df = pd.DataFrame(
-    {
-        "X": [0, 0, 1, 1, 2, 2],
-        "Y": [0, 1, 0, 1, 0, 1],
-        "probability": joint_xy.values.flatten(),
-    }
-)
+obs_data_df = counts.groupby(["X", "Y"]).size().reset_index(name="count")
+obs_data_df["probability"] = obs_data_df["count"] / obs_data_df["count"].sum()
+obs_data_df = obs_data_df.drop(columns=["count"])
 
 print(obs_data_df)
 # %%
@@ -121,3 +116,5 @@ for x1, x2 in contrast_pairs:
 results_df = pd.DataFrame(records)
 save_path = Path(__file__).parent / "sachs_6_1_ternary_contrast_results.csv"
 results_df.to_csv(save_path, index=False)
+
+# %%

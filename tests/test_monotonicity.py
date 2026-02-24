@@ -1,157 +1,304 @@
+"""
+Tests for monotonicity constraint filtering in the canonical basis.
+Verifies that worlds violating monotonicity constraints are correctly removed.
+"""
+
 import numpy as np
 import pytest
 
 from canonical import VectorizedCanonicalBasis
-from solver import LPSolver
-from symbolic import CounterfactualTerm, P, Variable
+from symbolic import CounterfactualTerm, MonotonicityConstraint, Variable
 
 
-def test_monotonicity_binary_defiers():
-    """
-    Test that monotonicity constraints force P(Defier) = 0 in a binary setting with uniform data.
-    Defier: Y_{x=0}=1 AND Y_{x=1}=0.
-    Monotonicity requires Y_{x=0} <= Y_{x=1}.
-    """
-    X = Variable("X", domain=(0, 1))
-    Y = Variable("Y", domain=(0, 1))
+class TestMonotonicityConstraintCreation:
+    """Test creation and representation of monotonicity constraints."""
 
-    # Uniform Data
-    data = {
-        (0, 0): 0.25,
-        (0, 1): 0.25,
-        (1, 0): 0.25,
-        (1, 1): 0.25,
-    }
+    def test_constraint_ge_creation(self):
+        """Test creating a >= constraint."""
+        Y = Variable("Y", domain=(0, 1))
+        X = Variable("X", domain=(0, 1))
 
-    basis = VectorizedCanonicalBasis([X, Y])
-    solver = LPSolver(basis, data, [X, Y])
+        lhs = Y @ {X: 1}
+        rhs = Y @ {X: 0}
 
-    # Define Defier Event: Y(x=0) = 1 AND Y(x=1) = 0
-    y_x0 = Y @ {X: 0}
-    y_x1 = Y @ {X: 1}
-    # Use & for joint event
-    defier_query = P((y_x0 == 1) & (y_x1 == 0))
+        constraint = lhs >= rhs
+        assert isinstance(constraint, MonotonicityConstraint)
+        assert constraint.operator == "ge"
+        assert constraint.lhs == lhs
+        assert constraint.rhs == rhs
 
-    # 1. Solve WITHOUT Monotonicity
-    lb_std, ub_std = solver.solve(defier_query, monotonic=False)
-    print(f"\nStandard Bounds for Defier: [{lb_std}, {ub_std}]")
+    def test_constraint_le_creation(self):
+        """Test creating a <= constraint."""
+        Y = Variable("Y", domain=(0, 1))
+        X = Variable("X", domain=(0, 1))
 
-    # Without constraints, defiers should be possible.
-    assert ub_std > 0, "Defiers should be possible without monotonicity"
+        lhs = Y @ {X: 1}
+        rhs = Y @ {X: 0}
 
-    # 2. Solve WITH Monotonicity (Global)
-    lb_mono, ub_mono = solver.solve(defier_query, monotonic=True)
-    print(f"Monotonic Bounds for Defier: [{lb_mono}, {ub_mono}]")
+        constraint = lhs <= rhs
+        assert isinstance(constraint, MonotonicityConstraint)
+        assert constraint.operator == "le"
 
-    # With monotonicity, defiers are impossible.
-    assert np.isclose(ub_mono, 0.0), "Defiers should be probability 0 with monotonicity"
-    assert np.isclose(lb_mono, 0.0)
+    def test_constraint_repr(self):
+        """Test string representation of constraints."""
+        Y = Variable("Y", domain=(0, 1))
+        X = Variable("X", domain=(0, 1))
 
+        lhs = Y @ {X: 1}
+        rhs = Y @ {X: 0}
 
-def test_monotonicity_ternary():
-    """
-    Test monotonicity with a ternary variable.
-    X (0,1) -> Y (0,1,2).
-    Monotonicity: x <= x' => Y_x <= Y_x'.
-    """
-    X = Variable("X", domain=(0, 1))
-    Y = Variable("Y", domain=(0, 1, 2))
+        constraint_ge = lhs >= rhs
+        assert ">=" in repr(constraint_ge)
 
-    # Construct data compatible with monotonicity
-    # e.g. Perfect correlation X=0->Y=0, X=1->Y=2
-    data = {
-        (0, 0): 0.5,
-        (1, 2): 0.5,
-        # Zero prob for others
-        (0, 1): 0.0,
-        (0, 2): 0.0,
-        (1, 0): 0.0,
-        (1, 1): 0.0,
-    }
+        constraint_le = lhs <= rhs
+        assert "<=" in repr(constraint_le)
 
-    basis = VectorizedCanonicalBasis([X, Y])
-    solver = LPSolver(basis, data, [X, Y])
+    def test_constraint_error_on_different_variables(self):
+        """Test that constraints on different variables raise an error."""
+        Y = Variable("Y", domain=(0, 1))
+        Z = Variable("Z", domain=(0, 1))
+        X = Variable("X", domain=(0, 1))
 
-    # Query: P(Y_{x=0} > Y_{x=1}) -> Should be 0 under monotonicity
-    y_x0 = Y @ {X: 0}
-    y_x1 = Y @ {X: 1}
+        lhs = Y @ {X: 1}
+        rhs = Z @ {X: 0}
 
-    q1 = P((y_x0 == 1) & (y_x1 == 0))
-    q2 = P((y_x0 == 2) & (y_x1 == 0))
-    q3 = P((y_x0 == 2) & (y_x1 == 1))
+        with pytest.raises(ValueError, match="must be on the same variable"):
+            _ = lhs >= rhs
 
-    violation_expr = q1 + q2 + q3
+    def test_constraint_error_on_non_counterfactual(self):
+        """Test that constraints on non-counterfactual terms raise an error."""
+        Y = Variable("Y", domain=(0, 1))
 
-    lb_mono, ub_mono = solver.solve(violation_expr, monotonic=True)
-
-    assert np.isclose(ub_mono, 0.0), "Monotonicity violation probability should be 0"
+        with pytest.raises(TypeError, match="must be between two CounterfactualTerms"):
+            _ = Y >= 1
 
 
-def test_monotonicity_subset():
-    """
-    Test enforcing monotonicity on a subset of variables.
-    Chain X -> M -> Y.
-    """
-    X = Variable("X", domain=(0, 1))
-    M = Variable("M", domain=(0, 1))
-    Y = Variable("Y", domain=(0, 1))
+class TestMonotonicityFiltering:
+    """Test the filter_worlds method on the canonical basis."""
 
-    # Uniform data
-    # (x, m, y)
-    data = {
-        (0, 0, 0): 0.125,
-        (0, 0, 1): 0.125,
-        (0, 1, 0): 0.125,
-        (0, 1, 1): 0.125,
-        (1, 0, 0): 0.125,
-        (1, 0, 1): 0.125,
-        (1, 1, 0): 0.125,
-        (1, 1, 1): 0.125,
-    }
+    def test_filter_simple_monotonicity_binary(self):
+        """
+        Test filtering with Y_{X=1} >= Y_{X=0} on binary variables.
+        This removes all worlds where Y increases when X goes from 1 to 0.
+        """
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
 
-    basis = VectorizedCanonicalBasis([X, M, Y])
-    solver = LPSolver(basis, data, [X, M, Y])
+        basis = VectorizedCanonicalBasis([X, Y])
+        n_worlds_before = basis.n_worlds
 
-    # Query: violations of M monotonicity + Y monotonicity
-    # M defier: M_0=1, M_1=0
-    m_x0 = M @ {X: 0}
-    m_x1 = M @ {X: 1}
-    m_defier = P((m_x0 == 1) & (m_x1 == 0))
+        # Constraint: Y_{X=1} >= Y_{X=0}
+        constraint = (Y @ {X: 1}) >= (Y @ {X: 0})
 
-    # Y defier (wrt M): Y_m0=1, Y_m1=0
-    # Note: Y depends on M. Check Y_{M=0}=1, Y_{M=1}=0
-    y_m0 = Y @ {M: 0}
-    y_m1 = Y @ {M: 1}
-    y_defier = P((y_m0 == 1) & (y_m1 == 0))
+        basis.filter_worlds([constraint])
+        n_worlds_after = basis.n_worlds
 
-    # 1. Monotonic only on M
-    # Should enforce M defier = 0, but allow Y defier > 0
-    lb_M, ub_M = solver.solve(m_defier, monotonic=[M])
-    lb_Y, ub_Y = solver.solve(y_defier, monotonic=[M])
+        # At least some worlds should be removed
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
 
-    assert np.isclose(ub_M, 0.0), "M should be monotonic"
-    assert ub_Y > 0, "Y should NOT be monotonic yet"
+        # Manually verify that all remaining worlds satisfy the constraint
+        for world_idx in range(basis.n_worlds):
+            term_y_x1 = Y @ {X: 1}
+            term_y_x0 = Y @ {X: 0}
 
-    # 2. Monotonic only on Y
-    # Should enforce Y defier = 0, but allow M defier > 0
-    lb_M2, ub_M2 = solver.solve(m_defier, monotonic=[Y])
-    lb_Y2, ub_Y2 = solver.solve(y_defier, monotonic=[Y])
+            val_y_x1 = basis.evaluate(term_y_x1)[world_idx]
+            val_y_x0 = basis.evaluate(term_y_x0)[world_idx]
 
-    assert ub_M2 > 0, "M should NOT be monotonic here"
-    # Note: ub_Y2 might be > 0 if there are confounding paths,
-    # but here Y only parent is M (in chain), so Y_{m=0} <= Y_{m=1} should hold if Y is monotonic w.r.t M.
-    # Actually Y has parents X, M in the basis?
-    # Wait, in the basis `VectorizedCanonicalBasis([X, M, Y])`,
-    # M has parent X. Y has parents X and M.
-    # Our data is uniform full joint.
-    # Y's monotonicity is checked against ALL parents (X and M).
-    # If we only intervene on M, X is random/observed.
-    # Monotonicity definition: f(x,m) <= f(x',m') if (x,m) <= (x',m').
-    # Here checking partial monotonicity w.r.t M means comparing (x,0) vs (x,1).
-    # Since we enforce monotonicity on Y, it must hold that Y(x,0) <= Y(x,1).
-    # Thus Y_{M=0} <= Y_{M=1} must hold for any specific x.
-    # The atomic counterfactual Y_{m=0} integrates over X.
-    # If for every u, Y_{m=0}(u) <= Y_{m=1}(u), then Y_{m=0} <= Y_{m=1} is almost certain?
-    # Yes, Y_{m=0, u} <= Y_{m=1, u} implies the event (Y_{m=0}=1 & Y_{m=1}=0) is impossible.
+            assert val_y_x1 >= val_y_x0, (
+                f"World {world_idx}: Y_{{X=1}}={val_y_x1} < Y_{{X=0}}={val_y_x0}"
+            )
 
-    assert np.isclose(ub_Y2, 0.0), "Y should be monotonic"
+    def test_filter_ternary_monotonicity(self):
+        """
+        Test filtering with ternary variables.
+        Y_{X=2} >= Y_{X=1} >= Y_{X=0} should be enforced.
+        """
+        X = Variable("X", domain=(0, 1, 2))
+        Y = Variable("Y", domain=(0, 1, 2))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        n_worlds_before = basis.n_worlds
+
+        # Constraints: Y is monotonic in X
+        constraint1 = (Y @ {X: 1}) >= (Y @ {X: 0})
+        constraint2 = (Y @ {X: 2}) >= (Y @ {X: 1})
+
+        basis.filter_worlds([constraint1, constraint2])
+        n_worlds_after = basis.n_worlds
+
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
+
+        # Verify all remaining worlds satisfy both constraints
+        for world_idx in range(basis.n_worlds):
+            y_x0 = basis.evaluate(Y @ {X: 0})[world_idx]
+            y_x1 = basis.evaluate(Y @ {X: 1})[world_idx]
+            y_x2 = basis.evaluate(Y @ {X: 2})[world_idx]
+
+            assert y_x1 >= y_x0
+            assert y_x2 >= y_x1
+
+    def test_filter_decreasing_monotonicity(self):
+        """
+        Test filtering with Y_{X=0} >= Y_{X=1} (decreasing monotonicity).
+        """
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        n_worlds_before = basis.n_worlds
+
+        # Constraint: Y_{X=0} >= Y_{X=1} (Y decreases as X increases)
+        constraint = (Y @ {X: 0}) >= (Y @ {X: 1})
+
+        basis.filter_worlds([constraint])
+        n_worlds_after = basis.n_worlds
+
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
+
+        # Verify all remaining worlds satisfy the constraint
+        for world_idx in range(basis.n_worlds):
+            y_x0 = basis.evaluate(Y @ {X: 0})[world_idx]
+            y_x1 = basis.evaluate(Y @ {X: 1})[world_idx]
+
+            assert y_x0 >= y_x1
+
+    def test_filter_le_constraint(self):
+        """Test filtering with <= (less than or equal) constraint."""
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        n_worlds_before = basis.n_worlds
+
+        # Constraint: Y_{X=1} <= Y_{X=0}
+        constraint = (Y @ {X: 1}) <= (Y @ {X: 0})
+
+        basis.filter_worlds([constraint])
+        n_worlds_after = basis.n_worlds
+
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
+
+        # Verify all remaining worlds satisfy the constraint
+        for world_idx in range(basis.n_worlds):
+            y_x1 = basis.evaluate(Y @ {X: 1})[world_idx]
+            y_x0 = basis.evaluate(Y @ {X: 0})[world_idx]
+            assert y_x1 <= y_x0
+
+    def test_no_filtering_with_empty_constraints(self):
+        """Test that empty constraints list does not modify the basis."""
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        n_worlds_before = basis.n_worlds
+
+        basis.filter_worlds([])
+
+        assert basis.n_worlds == n_worlds_before
+
+    def test_multiple_constraints_interaction(self):
+        """
+        Test that multiple constraints are applied correctly (AND semantics).
+        """
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+        Z = Variable("Z", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y, Z])
+        n_worlds_before = basis.n_worlds
+
+        # Constraints: Y is increasing in X, Z is increasing in Y
+        constraint_y = (Y @ {X: 1}) >= (Y @ {X: 0})
+        constraint_z = (Z @ {Y: 1}) >= (Z @ {Y: 0})
+
+        basis.filter_worlds([constraint_y, constraint_z])
+        n_worlds_after = basis.n_worlds
+
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
+
+        # Verify all remaining worlds satisfy both constraints
+        for world_idx in range(basis.n_worlds):
+            y_x0 = basis.evaluate(Y @ {X: 0})[world_idx]
+            y_x1 = basis.evaluate(Y @ {X: 1})[world_idx]
+            z_y0 = basis.evaluate(Z @ {Y: 0})[world_idx]
+            z_y1 = basis.evaluate(Z @ {Y: 1})[world_idx]
+
+            assert y_x1 >= y_x0
+            assert z_y1 >= z_y0
+
+    def test_filter_world_count_reduction(self):
+        """
+        Test that the number of removed worlds is as expected.
+        With monotonicity Y_{X=1} >= Y_{X=0}, we remove worlds where Y depends negatively on X.
+        For binary X, Y: 8 total worlds, expect exactly 2 to be removed
+        (the two worlds where Y(., 0) < Y(., 1)).
+        """
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        # 8 total worlds: 2^3 (2 vars * 2 domains each, but Y has 2 parent configs from X)
+
+        constraint = (Y @ {X: 1}) >= (Y @ {X: 0})
+        basis.filter_worlds([constraint])
+
+        # The constraint removes worlds where Y(X=0)=1 and Y(X=1)=0
+        # which is 1 function (out of 4 possible for Y), affecting 2 worlds
+        # So we expect 8 - 2 = 6 worlds remaining
+        assert basis.n_worlds == 6
+
+    def test_filter_preserves_evaluation_consistency(self):
+        """
+        Test that after filtering, the evaluate() method still works correctly
+        and returns correctly shaped arrays.
+        """
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([X, Y])
+        constraint = (Y @ {X: 1}) >= (Y @ {X: 0})
+        basis.filter_worlds([constraint])
+
+        # Evaluate various terms and check array shapes
+        val_x = basis.evaluate(X @ {})
+        val_y = basis.evaluate(Y @ {})
+        val_y_x0 = basis.evaluate(Y @ {X: 0})
+        val_y_x1 = basis.evaluate(Y @ {X: 1})
+
+        n_worlds = basis.n_worlds
+
+        assert val_x.shape == (n_worlds,)
+        assert val_y.shape == (n_worlds,)
+        assert val_y_x0.shape == (n_worlds,)
+        assert val_y_x1.shape == (n_worlds,)
+
+    def test_filter_with_complex_interventions(self):
+        """
+        Test filtering with more complex counterfactual terms (nested interventions).
+        """
+        Z = Variable("Z", domain=(0, 1))
+        X = Variable("X", domain=(0, 1))
+        Y = Variable("Y", domain=(0, 1))
+
+        basis = VectorizedCanonicalBasis([Z, X, Y])
+        n_worlds_before = basis.n_worlds
+
+        # Constraint: Y_{X=1} >= Y_{X=0} (Y monotonic in X)
+        constraint = (Y @ {X: 1}) >= (Y @ {X: 0})
+
+        basis.filter_worlds([constraint])
+        n_worlds_after = basis.n_worlds
+
+        assert n_worlds_after < n_worlds_before
+        assert n_worlds_after > 0
+
+        # Verify all remaining worlds satisfy the constraint
+        for world_idx in range(basis.n_worlds):
+            y_x0 = basis.evaluate(Y @ {X: 0})[world_idx]
+            y_x1 = basis.evaluate(Y @ {X: 1})[world_idx]
+            assert y_x1 >= y_x0

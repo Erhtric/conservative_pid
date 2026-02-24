@@ -3,7 +3,7 @@ High-level entry point for inference.
 Partial order extraction, permutation generation, bound aggregation
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
@@ -29,14 +29,17 @@ class ConservativePID:
     def __init__(
         self,
         observational_probs: pd.DataFrame,
+        experimental_probs: Optional[pd.DataFrame] = None,
     ):
         """
         Initializes the Conservative PID inference engine.
 
         Args:
             observational_probs: A pandas DataFrame containing the observational probabilities. Must have columns corresponding to variable names and a 'probability' column.
+            experimental_probs: Optional. A pandas DataFrame containing interventional data P(V|do(X), ...). Must have a 'probability' column. Variable columns can be a subset of the observational data (marginalization will be performed).
         """
         self.observational_probs: pd.DataFrame = observational_probs
+        self.experimental_probs: Optional[pd.DataFrame] = experimental_probs
         self.monotonicity_constraints: List[MonotonicityConstraint] = []
 
     def add_monotonicity(self, constraint: MonotonicityConstraint) -> None:
@@ -104,7 +107,7 @@ class ConservativePID:
                 ordered_vars, query, return_problems=return_problems
             )
 
-        # 1. Extract Partial Order from Query
+        # If no causal order is provided --> extract partial order from query and search over compatible permutations
         partial_order = self._extract_partial_order(query)
 
         var_map = {}
@@ -123,7 +126,6 @@ class ConservativePID:
             if name not in [n.name for n in partial_order.nodes]:
                 partial_order.add_node(var_map[name])
 
-        # 2. Generate Linear Extensions
         try:
             valid_orders = list(nx.all_topological_sorts(partial_order))
         except nx.NetworkXUnfeasible:
@@ -135,11 +137,10 @@ class ConservativePID:
             f"Found {len(valid_orders)} valid causal orders compatible with the query."
         )
 
+        # Iterate and Aggregate
         global_lb = float("inf")
         global_ub = float("-inf")
         global_problems: Dict[str, Any] = {"lower": None, "upper": None}
-
-        # 3. Iterate and Aggregate
         for i, order_nodes in enumerate(valid_orders):
             ordered_vars = []
             for node in order_nodes:
@@ -193,7 +194,12 @@ class ConservativePID:
             )
             basis.filter_worlds(self.monotonicity_constraints)
             logger.debug(f"Number of worlds after filtering: {basis.n_worlds}")
-        solver = LPSolver(basis, self.observational_probs, ordered_vars)
+        solver = LPSolver(
+            basis,
+            self.observational_probs,
+            ordered_vars,
+            experimental_probs=self.experimental_probs,
+        )
         return solver.solve(query, return_problems=return_problems)
 
     def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
@@ -258,22 +264,55 @@ class ConservativePID:
 
         Args:
             query: The causal query P(gamma | delta).
+
+        Raises:
+            ValueError: If probabilities are invalid or data is malformed.
         """
+        # Validate observational data
+        self._validate_probability_data(self.observational_probs, "observational")
+
+        # Validate experimental data (if provided)
+        if self.experimental_probs is not None:
+            self._validate_probability_data(self.experimental_probs, "experimental")
+
+    def _validate_probability_data(
+        self, data: pd.DataFrame, data_type: str = "observational"
+    ):
+        """
+        Validates a probability DataFrame.
+
+        Args:
+            data: The DataFrame to validate.
+            data_type: "observational" or "experimental" for error messages.
+
+        Raises:
+            ValueError: If any probability is invalid or sums are incorrect.
+        """
+        if "probability" not in data.columns:
+            raise ValueError(
+                f"{data_type.capitalize()} data missing 'probability' column."
+            )
+
         total_prob = 0.0
 
-        for _, row in self.observational_probs.iterrows():
+        for i, (_, row) in enumerate(data.iterrows()):
             prob: float = row["probability"]
+
+            if not isinstance(prob, (int, float)):
+                raise ValueError(
+                    f"Row {i} in {data_type} data: probability must be numeric, got {type(prob)}."
+                )
 
             if prob < 0 or prob > 1:
                 raise ValueError(
-                    f"Probability {prob} in data is invalid. Must be between 0 and 1."
+                    f"Row {i} in {data_type} data: probability {prob} is invalid. Must be in [0, 1]."
                 )
 
             total_prob += prob
 
         if not np.isclose(total_prob, 1.0, atol=1e-5):
             raise ValueError(
-                f"Observational probabilities sum to {total_prob}, expected 1.0."
+                f"{data_type.capitalize()} probabilities sum to {total_prob}, expected 1.0 (atol=1e-5)."
             )
 
     def __repr__(self):

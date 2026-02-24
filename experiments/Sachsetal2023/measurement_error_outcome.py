@@ -6,10 +6,8 @@ import numpy as np
 import time
 from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.factors.discrete import TabularCPD
-from pgmpy.inference import VariableElimination
+from pgmpy.sampling.Sampling import BayesianModelSampling
 
-# fix seed
-np.random.seed(42)
 
 repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
@@ -43,22 +41,21 @@ def sachs_measurement_error_bounds(pxy: pd.DataFrame, x1, x2):
 
 # %%
 model = DiscreteBayesianNetwork([("X", "Y"), ("Y", "Y2")])
+cpd_x = TabularCPD(variable="X", variable_card=2, values=[[0.5], [0.5]])
 
-cpd_x = TabularCPD(variable="X", variable_card=2, values=[[0.6], [0.4]])
-
-# ur_dist = np.random.dirichlet(np.ones(2), size=1).T
-# cpd_ur = TabularCPD(
-# variable="U_r",
-# variable_card=2,
-# values=ur_dist,
-# )
+ur_dist = np.random.dirichlet(np.ones(2), size=1).T
+cpd_ur = TabularCPD(
+    variable="U_r",
+    variable_card=2,
+    values=ur_dist,
+)
 
 cpd_y = TabularCPD(
     variable="Y",
     variable_card=2,
     values=[
-        [0.2, 0.8],
-        [0.8, 0.2],
+        [0.5, 0.7],
+        [0.5, 0.3],
     ],
     evidence=["X"],
     evidence_card=[2],
@@ -68,32 +65,24 @@ cpd_y2 = TabularCPD(
     variable="Y2",
     variable_card=2,
     values=[
-        [0.9, 0.1],
-        [0.1, 0.9],
+        [0.9, 0.4],
+        [0.1, 0.6],
     ],
     evidence=["Y"],
     evidence_card=[2],
 )
 
 model.add_cpds(cpd_x, cpd_y, cpd_y2)
-ie = VariableElimination(model)
-
-# %%
-joint_xy2 = ie.query(variables=["X", "Y2"], joint=True)
-
-obs_data_df = pd.DataFrame(
-    {
-        "X": [0, 0, 1, 1],
-        "Y2": [0, 1, 0, 1],
-        "probability": joint_xy2.values.flatten(),
-    }
+data = BayesianModelSampling(model).forward_sample(
+    size=10000, seed=42, show_progress=False
 )
 
-print(obs_data_df)
+# %%
+obs_data_df = data.groupby(["X", "Y", "Y2"]).size().reset_index(name="count")
+obs_data_df["probability"] = obs_data_df["count"] / obs_data_df["count"].sum()
+obs_data_df = obs_data_df.drop(columns=["count"])
 
-# Add a uniform Y to the data to make it compatible with our solver (which requires a full joint over X, Y, Y2)
-obs_data_df["Y"] = 0
-obs_data_df = obs_data_df[["X", "Y", "Y2", "probability"]]
+print(obs_data_df)
 
 # %%
 contrast_pairs = [(1, 0)]
@@ -105,11 +94,10 @@ Y2 = Variable("Y2", domain=(0, 1))
 pid = ConservativePID(obs_data_df)
 
 monotonicity_constraint = (Y2 @ {Y: 1}) >= (Y2 @ {Y: 0})
-# pid.add_monotonicity(monotonicity_constraint)
+pid.add_monotonicity(monotonicity_constraint)
 
 print(f"\n{'Contrast':<15} | {'Sachs (6.3)':<20} | {'Ours (LP)':<20}")
 print("-" * 65)
-
 
 sachs_lb, sachs_ub = sachs_measurement_error_bounds(obs_data_df, 1, 0)
 
