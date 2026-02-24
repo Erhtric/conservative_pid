@@ -6,7 +6,23 @@ Counterfactual Terms, Events and Queries
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, OrderedDict, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
+
+
+@dataclass(frozen=True)
+class MonotonicityConstraint:
+    """
+    Represents a monotonicity constraint between two counterfactual terms.
+    e.g., Y_{X=1} >= Y_{X=0}
+    """
+
+    lhs: CounterfactualTerm
+    rhs: CounterfactualTerm
+    operator: str  # 'ge' or 'le'
+
+    def __repr__(self):
+        op_str = ">=" if self.operator == "ge" else "<="
+        return f"{self.lhs!r} {op_str} {self.rhs!r}"
 
 
 @dataclass(frozen=True)
@@ -99,6 +115,24 @@ class CounterfactualTerm:
         # Note: We return an Event, not a boolean. This overrides standard equality.
         return Event({self: other})
 
+    def __ge__(self, other: Any) -> MonotonicityConstraint:
+        if not isinstance(other, CounterfactualTerm):
+            raise TypeError(
+                "Monotonicity constraints must be between two CounterfactualTerms."
+            )
+        if self.variable != other.variable:
+            raise ValueError("Monotonicity constraints must be on the same variable.")
+        return MonotonicityConstraint(self, other, "ge")
+
+    def __le__(self, other: Any) -> MonotonicityConstraint:
+        if not isinstance(other, CounterfactualTerm):
+            raise TypeError(
+                "Monotonicity constraints must be between two CounterfactualTerms."
+            )
+        if self.variable != other.variable:
+            raise ValueError("Monotonicity constraints must be on the same variable.")
+        return MonotonicityConstraint(self, other, "le")
+
     def __lt__(self, other):
         return str(self) < str(other)
 
@@ -142,23 +176,19 @@ class Event:
         Raises:
             ValueError: If there are contradictory assignments.
         """
-        # Identify which terms are nested if there are any
         nested_term_loc = None
 
         for term in self.assignments.keys():
             for int_var, int_val in term.intervention.items():
                 if isinstance(int_val, CounterfactualTerm):
-                    # Nested: term has intervention {int_var: int_val}
                     nested_term_loc = (term, int_var, int_val)
                     break
                 if nested_term_loc:
                     break
 
-        # Base case: no nesting found, return self as a single item list
         if not nested_term_loc:
             return [self]
 
-        # Recursive step: unnest the first nesting found
         outer_term: CounterfactualTerm = nested_term_loc[0]
         inner_var: Variable = nested_term_loc[1]
         inner_term: CounterfactualTerm = nested_term_loc[2]
@@ -167,28 +197,21 @@ class Event:
             raise ValueError("Inner variable has no domain.")
 
         expanded_events = []
-        # Iterate over the domain of the inner variable
         for val in inner_var.domain:
-            # Create a new event with two atomic propositions
-            # 1. The outer term with the intervention set to the current value
-            # Note this modification of the subscript holds only for the inner_var variable, the others are left untouched
             new_outer_term = CounterfactualTerm(
                 outer_term.variable,
                 {**outer_term.intervention, inner_var: val},
             )
 
-            # 2. The inner term with the intervention set to the current value while keeping the rest of the intervention
             new_inner_term = CounterfactualTerm(
                 inner_term.variable,
                 {**inner_term.intervention},
             )
 
-            # Create a new event with the two atomic propositions
             conjunction = Event(
                 {new_outer_term: self.assignments[outer_term], new_inner_term: val}
             )
 
-            # Add the new event to the list of expanded events
             expanded_events.append(conjunction)
 
         return expanded_events
@@ -200,7 +223,6 @@ class Event:
         """
         new_assigments = self.assignments.copy()
 
-        # Check for contradictions
         for term, value in other.assignments.items():
             if term in new_assigments and new_assigments[term] != value:
                 raise ValueError(
@@ -211,7 +233,6 @@ class Event:
         return Event(new_assigments)
 
     def __repr__(self):
-        # Sort by the string representation of the term for stability
         items = []
         for term, val in self.assignments.items():
             items.append(f"{term!r}={val!r}")
@@ -221,7 +242,6 @@ class Event:
         return bool(self.assignments)
 
     def __hash__(self):
-        # Sort assignments by term string/hash
         items = tuple(sorted(self.assignments.items(), key=lambda x: str(x[0])))
         return hash(items)
 
@@ -246,10 +266,8 @@ class Query:
 
     def expand(self) -> Expression:
         """Expand the query"""
-        # Expand the target event into disjoint events (summation)
         expanded_targets = self.target.expand()
 
-        # Return an Expression summing over the expanded queries
         return Expression({Query(t, self.evidence): 1.0 for t in expanded_targets})
 
     def __repr__(self):

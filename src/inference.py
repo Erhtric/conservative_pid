@@ -3,15 +3,22 @@ High-level entry point for inference.
 Partial order extraction, permutation generation, bound aggregation
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
-import pulp
+import pandas as pd
 from loguru import logger
 
-from solver import LPSolver, VectorizedCanonicalBasis
-from symbolic import CounterfactualTerm, Event, Expression, Query, Variable
+from .canonical import VectorizedCanonicalBasis
+from .solver import LPSolver
+from .symbolic import (
+    CounterfactualTerm,
+    Expression,
+    Query,
+    Variable,
+    MonotonicityConstraint,
+)
 
 
 class ConservativePID:
@@ -21,64 +28,100 @@ class ConservativePID:
 
     def __init__(
         self,
-        variables: List[Variable],
-        observational_probs: Dict[Tuple[Tuple[str, Any], ...], float],
+        observational_probs: pd.DataFrame,
     ):
         """
         Initializes the Conservative PID inference engine.
 
         Args:
-            variables: List of Variable objects representing the SCM. Not necessarily ordered.
-            observational_probs: Dictionary mapping tuples of variable (Name, value) to their observational probabilities.
+            observational_probs: A pandas DataFrame containing the observational probabilities. Must have columns corresponding to variable names and a 'probability' column.
         """
-        self.variables: list[Variable] = variables
-        self.observational_probs: dict[tuple[tuple[str, Any], ...], int | float] = (
-            observational_probs
-        )
+        self.observational_probs: pd.DataFrame = observational_probs
+        self.monotonicity_constraints: List[MonotonicityConstraint] = []
+
+    def add_monotonicity(self, constraint: MonotonicityConstraint) -> None:
+        """
+        Adds a monotonicity constraint to the inference engine.
+
+        Args:
+            constraint: A MonotonicityConstraint object.
+        """
+        self.monotonicity_constraints.append(constraint)
 
     def infer(
         self,
         query: Union[Query, Expression],
-        causal_order: Optional[List[str]] = None,
-        monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[float, float]:
+        causal_order: Optional[List[Variable]] = None,
+        return_problems: bool = False,
+    ) -> Union[Tuple[float, float], Tuple[float, float, Dict[str, Any]]]:
         """
         Computes bounds for a query or expression.
 
         Args:
             query: A Query or Expression object.
-            causal_order: (Optional) A list of variable names, e.g. ['X', 'Z', 'Y'], representing
+            causal_order: (Optional) A list of Variable objects, e.g. [X, Z, Y], representing
                             the known topological order. If provided, skips permutation search.
-                            NB: this only works with variables names for now.
-            monotonic: If True, enforces monotonicity on all variables.
-                       If a list of Variables, enforces monotonicity only on those variables.
+            return_problems: Whether to return the pulp LP problem objects.
 
         Returns:
-            A tuple containing the lower and upper bounds (lb, ub).
+            If return_problems is False: (lb, ub)
+            If return_problems is True: (lb, ub, {"lower": lower_prob, "upper": upper_prob})
         """
         self._validate_inputs(query)
         logger.success("Input validation passed.")
 
+        var_names_in_data = [
+            col for col in self.observational_probs.columns if col != "probability"
+        ]
+
         if causal_order:
-            logger.info(f"Using fixed causal order: {causal_order}")
+            logger.info(f"Using fixed causal order: {[v.name for v in causal_order]}")
 
-            if set(causal_order) != set(v.name for v in self.variables):
-                raise ValueError(
-                    "Fixed order must contain exactly all defined variables."
-                )
+            ordered_vars = []
+            for item in causal_order:
+                if isinstance(item, Variable):
+                    if not item.domain and item.name in var_names_in_data:
+                        domain = tuple(
+                            sorted(self.observational_probs[item.name].unique())
+                        )
+                        ordered_vars.append(Variable(item.name, domain))
+                    else:
+                        ordered_vars.append(item)
+                else:
+                    raise TypeError(
+                        f"Invalid type in causal_order: {type(item)}. Expected Variable."
+                    )
 
-            # Convert names to Variable objects
-            # TODO: add the possibility pass a list of Variable objects instead of names
-            var_map = {v.name: v for v in self.variables}
-            ordered_vars = [var_map[name] for name in causal_order]
+            # Check if all variables in data are in the causal order
+            ordered_var_names = [v.name for v in ordered_vars]
+            for name in var_names_in_data:
+                if name not in ordered_var_names:
+                    raise ValueError(
+                        f"Variable '{name}' is in observational data but not in causal_order."
+                    )
 
-            # TODO: check if the fixed order allows the query
+            return self._solve_for_order(
+                ordered_vars, query, return_problems=return_problems
+            )
 
-            return self._solve_for_order(ordered_vars, query, monotonic=monotonic)
-
-        # NO ORDER KNOWN
         # 1. Extract Partial Order from Query
-        partial_order: nx.DiGraph = self._extract_partial_order(query)
+        partial_order = self._extract_partial_order(query)
+
+        var_map = {}
+        for node in partial_order.nodes:
+            var_map[node.name] = node
+
+        for name in var_names_in_data:
+            domain = tuple(sorted(self.observational_probs[name].unique()))
+            if name in var_map:
+                if not var_map[name].domain:
+                    var_map[name] = Variable(name, domain)
+            else:
+                var_map[name] = Variable(name, domain)
+
+        for name in var_names_in_data:
+            if name not in [n.name for n in partial_order.nodes]:
+                partial_order.add_node(var_map[name])
 
         # 2. Generate Linear Extensions
         try:
@@ -94,19 +137,42 @@ class ConservativePID:
 
         global_lb = float("inf")
         global_ub = float("-inf")
+        global_problems: Dict[str, Any] = {"lower": None, "upper": None}
 
         # 3. Iterate and Aggregate
-        for i, order_names in enumerate(valid_orders):
-            var_map: dict[str, Variable] = {v.name: v for v in self.variables}
-            ordered_vars: list[Variable] = [var_map[name] for name in order_names]
+        for i, order_nodes in enumerate(valid_orders):
+            ordered_vars = []
+            for node in order_nodes:
+                if node.name in var_map and var_map[node.name].domain:
+                    ordered_vars.append(var_map[node.name])
+                else:
+                    raise ValueError(
+                        f"Variable '{node.name}' is in the query but not in the observational data, "
+                        f"and its domain could not be inferred."
+                    )
 
-            lb, ub = self._solve_for_order(ordered_vars, query, monotonic=monotonic)
+            res = self._solve_for_order(
+                ordered_vars, query, return_problems=return_problems
+            )
+            if return_problems:
+                lb, ub, probs = res
+            else:
+                lb, ub = res
 
-            # Update Global Bounds (Algorithm 2: min of LBs, max of UBs)
             if not np.isnan(lb):
-                global_lb = min(global_lb, lb)
+                if lb < global_lb:
+                    global_lb = lb
+                    if return_problems:
+                        global_problems["lower"] = probs["lower"]
+
             if not np.isnan(ub):
-                global_ub = max(global_ub, ub)
+                if ub > global_ub:
+                    global_ub = ub
+                    if return_problems:
+                        global_problems["upper"] = probs["upper"]
+
+        if return_problems:
+            return global_lb, global_ub, global_problems
 
         return global_lb, global_ub
 
@@ -114,18 +180,21 @@ class ConservativePID:
         self,
         ordered_vars: List[Variable],
         query: Query | Expression,
-        monotonic: Union[bool, List[Variable]] = False,
-    ) -> Tuple[float, float]:
+        return_problems: bool = False,
+    ) -> Union[Tuple[float, float], Tuple[float, float, Dict[str, Any]]]:
         """
         Helper to run the pipeline for a single specific order.
         """
-        logger.debug(
-            f"Solving for order: {[v.name for v in ordered_vars]} with monotonic={monotonic}"
-        )
+        logger.debug(f"Solving for order: {[v.name for v in ordered_vars]}")
         basis = VectorizedCanonicalBasis(ordered_vars)
+        if self.monotonicity_constraints:
+            logger.debug(
+                f"Applying {len(self.monotonicity_constraints)} monotonicity constraints. Number of worlds before filtering: {basis.n_worlds}"
+            )
+            basis.filter_worlds(self.monotonicity_constraints)
+            logger.debug(f"Number of worlds after filtering: {basis.n_worlds}")
         solver = LPSolver(basis, self.observational_probs, ordered_vars)
-        lb, ub = solver.solve(query, monotonic=monotonic)
-        return lb, ub
+        return solver.solve(query, return_problems=return_problems)
 
     def _extract_partial_order(self, query: Union[Query, Expression]) -> nx.DiGraph:
         """
@@ -138,7 +207,8 @@ class ConservativePID:
             A directed acyclic graph (DAG) representing the strict partial order.
         """
         G = nx.DiGraph()
-        G.add_nodes_from([v.name for v in self.variables])
+
+        variables_in_query = set()
 
         if isinstance(query, Query):
             queries = [query]
@@ -151,11 +221,20 @@ class ConservativePID:
                 terms.extend(q.evidence.assignments.keys())
 
             for term in terms:
+                variables_in_query.add(term.variable)
                 self._add_subscript_constraints(G, term)
+
+        for var in variables_in_query:
+            if not G.has_node(var):
+                G.add_node(var)
 
         return G
 
-    def _add_subscript_constraints(self, G: nx.DiGraph, term: CounterfactualTerm):
+    def _add_subscript_constraints(
+        self,
+        G: nx.DiGraph,
+        term: CounterfactualTerm,
+    ):
         """
         Recursively adds constraints to the graph based on the counterfactual term.
         Modify in-place the associated DAG.
@@ -165,9 +244,9 @@ class ConservativePID:
             G: The graph to add constraints to.
             term: The counterfactual term to add constraints for.
         """
-        target = term.variable.name
+        target = term.variable
         for var, val in term.intervention.items():
-            cause = var.name
+            cause = var
             if not G.has_edge(cause, target):
                 G.add_edge(cause, target)
             if isinstance(val, CounterfactualTerm):
@@ -180,26 +259,10 @@ class ConservativePID:
         Args:
             query: The causal query P(gamma | delta).
         """
-        # 1. Check Variables
-        for var in self.variables:
-            if var.domain is None or len(var.domain) == 0:
-                raise ValueError(f"Variable '{var.name}' must have a non-empty domain.")
-
-        # 2. Check Observational Data
-        expected_len = len(self.variables)
         total_prob = 0.0
 
-        for row, prob in self.observational_probs.items():
-            if len(row) != expected_len:
-                raise ValueError(
-                    f"Data row {row} has length {len(row)}, expected {expected_len} (variables: {[v.name for v in self.variables]})."
-                )
-            # Check domain compatibility
-            for i, val in enumerate(row):
-                if val not in self.variables[i].domain:
-                    raise ValueError(
-                        f"Value '{val}' in data row {row} is not in domain of variable '{self.variables[i].name}'."
-                    )
+        for _, row in self.observational_probs.iterrows():
+            prob: float = row["probability"]
 
             if prob < 0 or prob > 1:
                 raise ValueError(
@@ -213,78 +276,5 @@ class ConservativePID:
                 f"Observational probabilities sum to {total_prob}, expected 1.0."
             )
 
-        # 3. Check Query or Expression
-        known_vars = set(self.variables)
-
-        # Helper to check an event
-        def check_event(event: Event, context: str):
-            for term, val in event.assignments.items():
-                if term.variable not in known_vars:
-                    raise ValueError(
-                        f"Unknown variable '{term.variable.name}' in query {context}."
-                    )
-
-                # Recursively check intervention variables
-                self._check_intervention_vars(term, known_vars)
-
-        def validate_single_query(q: Query):
-            if not isinstance(q.target, Event):
-                raise TypeError("Query target must be an Event object.")
-            check_event(q.target, "target")
-
-            if q.evidence:
-                if not isinstance(q.evidence, Event):
-                    raise TypeError("Query evidence must be an Event object.")
-                check_event(q.evidence, "evidence")
-
-        if isinstance(query, Expression):
-            for sub_query in query.terms.keys():
-                validate_single_query(sub_query)
-        elif isinstance(query, Query):
-            validate_single_query(query)
-        else:
-            raise TypeError("Input must be a Query or an Expression object.")
-
-    def _check_intervention_vars(self, term: CounterfactualTerm, known_vars: set):
-        for var, val in term.intervention.items():
-            if var not in known_vars:
-                raise ValueError(
-                    f"Unknown intervention variable '{var.name}' in term '{term}'."
-                )
-            if isinstance(val, CounterfactualTerm):
-                self._check_intervention_vars(val, known_vars)
-
-    @staticmethod
-    def marginalize_data(
-        data: Dict[Tuple[Any, ...], float],
-        all_variables: List[Variable],
-        target_variables: List[Variable],
-    ) -> Dict[Tuple[Any, ...], float]:
-        """
-        Marginalizes the observational data to the subset of target variables.
-
-        Args:
-            data: The full observational data dictionary.
-            all_variables: The list of variables corresponding to the full data tuples.
-            target_variables: The subset of variables to keep.
-
-        Returns:
-            A new data dictionary with keys corresponding to target_variables and aggregated probabilities.
-        """
-        if not set(target_variables).issubset(set(all_variables)):
-            raise ValueError("Target variables must be a subset of all variables.")
-
-        # Find indices of target variables in the original list
-        indices = [all_variables.index(var) for var in target_variables]
-
-        new_data = {}
-
-        for full_tuple, prob in data.items():
-            # Extract sub-tuple
-            sub_tuple = tuple(full_tuple[i] for i in indices)
-            new_data[sub_tuple] = new_data.get(sub_tuple, 0.0) + prob
-
-        return new_data
-
     def __repr__(self):
-        return f"ConservativePID(variables={self.variables}, data={self.observational_probs})"
+        return f"ConservativePID(data={self.observational_probs})"

@@ -1,0 +1,2 @@
+x1,x2,target,sachs_lb,sachs_ub,cpid_lb,cpid_ub,cpid_time_sec
+1,0,P(Y_1=1) - P(Y_0=1),-0.3599999999999999,1.0,0.382,0.882,0.055608272552490234
