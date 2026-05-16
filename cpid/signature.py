@@ -20,6 +20,11 @@ class SignatureQueryEvaluator:
         self.signature = signature_obj
         self.query = query
 
+        try:
+            self.signature.is_compatible(self.query)
+        except ValueError as e:
+            raise ValueError(f"Signature is not compatible with query: {e}")
+
     def _get_function_index(
         self, parent_vals: list[int], parent_names: list[str]
     ) -> int:
@@ -49,7 +54,6 @@ class SignatureQueryEvaluator:
     def evaluate_state(
         self,
         row: list[tuple[int]],
-        signature_obj: ResponseSignature,
         interventions: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """
@@ -68,13 +72,13 @@ class SignatureQueryEvaluator:
             interventions = {}
 
         state = {}
-        for i, node in enumerate(signature_obj.ordered_nodes):
+        for i, node in enumerate(self.signature.ordered_nodes):
             if node in interventions:
                 # Override with intervention
                 state[node] = interventions[node]
             else:
                 # Calculate from parents
-                parents = signature_obj.structure[node]
+                parents = self.signature.structure[node]
                 parent_vals = [state[p] for p in parents]
                 func_idx = self._get_function_index(parent_vals, parents)
                 state[node] = row[i][func_idx]
@@ -82,9 +86,7 @@ class SignatureQueryEvaluator:
 
     def row_satisfies_query(
         self,
-        row: list[tuple[int]],
-        signature_obj: ResponseSignature,
-        query: CausalQuery,
+        sig_row: list[tuple[int]],
     ) -> bool:
         """
         Checks if a specific signature row satisfies the entire CausalQuery.
@@ -98,13 +100,13 @@ class SignatureQueryEvaluator:
         Returns:
             bool: True if the row satisfies the query, False otherwise.
         """
-        if query.evidence:
-            nat_state = self.evaluate_state(row, signature_obj, interventions={})
-            for e_var, e_val in query.evidence.items():
+        if self.query.evidence:
+            nat_state = self.evaluate_state(sig_row, self.signature, interventions={})
+            for e_var, e_val in self.query.evidence.items():
                 if nat_state[e_var] != e_val:
                     return False
 
-        for atomic in query.counterfactuals:
+        for atomic in self.query.counterfactuals:
             # Ensure the query has been un-nested: interventions should be ints
             for iv in atomic.interventions.values():
                 if not isinstance(iv, int):
@@ -112,10 +114,7 @@ class SignatureQueryEvaluator:
                         "Nested interventions detected during evaluation. Call `CausalQuery.unnest(domains)` before evaluating or solving LPs."
                     )
 
-            int_state = self.evaluate_state(
-                row, signature_obj, interventions=atomic.interventions
-            )
-
+            int_state = self.evaluate_state(sig_row, interventions=atomic.interventions)
             if int_state[atomic.target_var] != atomic.target_val:
                 return False
 
