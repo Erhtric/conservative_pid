@@ -19,6 +19,14 @@ def test_total_order_signature_basic():
     assert sig.size == 8
 
 
+def test_signature_iter_space_matches_precomputed_space():
+    domains = {"X": 2, "Y": 2}
+    total_order = ["X", "Y"]
+    sig = TotalOrderSignature(domains, total_order)
+
+    assert list(sig.iter_space()) == sig.space
+
+
 def test_partial_order_signature_from_query():
     # small example: intervention on X, outcome Y
     domains = {"X": 2, "Y": 2}

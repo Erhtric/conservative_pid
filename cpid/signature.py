@@ -20,10 +20,11 @@ class SignatureQueryEvaluator:
         self.signature = signature_obj
         self.query = query
 
-        try:
-            self.signature.is_compatible(self.query)
-        except ValueError as e:
-            raise ValueError(f"Signature is not compatible with query: {e}")
+        if self.signature is not None and self.query is not None:
+            try:
+                self.signature.is_compatible(self.query)
+            except ValueError as e:
+                raise ValueError(f"Signature is not compatible with query: {e}")
 
     def _get_function_index(
         self, parent_vals: list[int], parent_names: list[str]
@@ -95,18 +96,25 @@ class SignatureQueryEvaluator:
         Args:
             row: A list of tuples representing the function outputs for each node.
             signature_obj: The ResponseSignature object defining the structure.
-            query: The CausalQuery to evaluate against.
 
         Returns:
             bool: True if the row satisfies the query, False otherwise.
         """
-        if self.query.evidence:
-            nat_state = self.evaluate_state(sig_row, self.signature, interventions={})
-            for e_var, e_val in self.query.evidence.items():
+        active_query = self.query
+        if active_query is None:
+            raise ValueError("No query provided to SignatureQueryEvaluator.")
+        if not isinstance(active_query, CausalQuery):
+            raise TypeError(
+                "SignatureQueryEvaluator.row_satisfies_query expects a CausalQuery."
+            )
+
+        if active_query.evidence:
+            nat_state = self.evaluate_state(sig_row, interventions={})
+            for e_var, e_val in active_query.evidence.items():
                 if nat_state[e_var] != e_val:
                     return False
 
-        for atomic in self.query.counterfactuals:
+        for atomic in active_query.counterfactuals:
             # Ensure the query has been un-nested: interventions should be ints
             for iv in atomic.interventions.values():
                 if not isinstance(iv, int):
@@ -165,7 +173,7 @@ class ResponseSignature(ABC):
         Value: Cardinality (number of response signatures belonging to this class)
         """
         equivalence_classes = {}
-        evaluator = SignatureQueryEvaluator(self.domains)
+        state_evaluator = SignatureQueryEvaluator(self.domains, signature_obj=self)
 
         # Extract flat queries and evidence for coefficient evaluation
         if isinstance(query, CausalExpression):
@@ -176,21 +184,26 @@ class ResponseSignature(ABC):
             evidence_dict = query.evidence
 
         evidence_query = CausalQuery(counterfactuals=[], evidence=evidence_dict)
+        query_evaluators = [
+            (SignatureQueryEvaluator(self.domains, signature_obj=self, query=cq), w)
+            for cq, w in flat_expr.terms.items()
+        ]
+        evidence_evaluator = SignatureQueryEvaluator(
+            self.domains, signature_obj=self, query=evidence_query
+        )
 
         # WARNING: Naive iteration. For large domains, this must be replaced
         # with a symbolic counting algorithm to bypass self.iter_space().
         for sig in self.iter_space():
-            nat_state = evaluator.evaluate_state(sig, self)
+            nat_state = state_evaluator.evaluate_state(sig)
             nat_tuple = tuple(nat_state[v] for v in self.ordered_nodes)
 
             num_coeff = 0.0
-            for cq, w in flat_expr.terms.items():
-                if evaluator.row_satisfies_query(sig, self, cq):
+            for evaluator, w in query_evaluators:
+                if evaluator.row_satisfies_query(sig):
                     num_coeff += w
 
-            den_coeff = (
-                1.0 if evaluator.row_satisfies_query(sig, self, evidence_query) else 0.0
-            )
+            den_coeff = 1.0 if evidence_evaluator.row_satisfies_query(sig) else 0.0
 
             eq_key = (nat_tuple, num_coeff, den_coeff)
             equivalence_classes[eq_key] = equivalence_classes.get(eq_key, 0) + 1
