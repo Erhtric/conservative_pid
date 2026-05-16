@@ -14,8 +14,6 @@ dependencies = [
     "pandas>=3.0.0",
     "pgmpy>=1.0.0",
     "pulp>=3.3.0",
-    "pyagrum>=2.3.2",
-    "pymc>=5.26.1",
 ]
 
 [dependency-groups]
@@ -25,9 +23,12 @@ dev = [
     "mkdocs-material>=9.7.1",
     "mkdocstrings[python]>=1.0.2",
     "pytest>=9.0.2",
+    "pytest-cov>=7.1.0",
+    "tabulate>=0.10.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
-  "src"
+  "src",
+  "."
 ]
