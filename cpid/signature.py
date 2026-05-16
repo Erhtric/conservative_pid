@@ -2,6 +2,124 @@ import itertools
 import math
 from abc import ABC, abstractmethod
 from .io import CausalQuery, CausalExpression
+import networkx as nx
+
+
+class SignatureQueryEvaluator:
+    """
+    Evaluates whether a given signature row satisfies a CausalQuery.
+    """
+
+    def __init__(
+        self,
+        domains: dict[str, int],
+        signature_obj: ResponseSignature | None = None,
+        query: CausalQuery | CausalExpression | None = None,
+    ):
+        self.domains = domains
+        self.signature = signature_obj
+        self.query = query
+
+    def _get_function_index(
+        self, parent_vals: list[int], parent_names: list[str]
+    ) -> int:
+        """Converts a tuple of parent values into a flat list index.
+
+        Args:
+            parent_vals: A list of parent variable values (e.g., [0, 1]).
+            parent_names: A list of parent variable names in the same order as parent_vals (e.g., ['X', 'Z']).
+
+        Returns:
+            An integer index corresponding to the combination of parent values.
+
+        Usage:
+            For example, if parent_names = ['X', 'Z'] and domains = {'X': 2, 'Z': 2}, then:
+            - parent_vals = [0, 0] -> index 0
+            - parent_vals = [0, 1] -> index 1
+            - parent_vals = [1, 0] -> index 2
+            - parent_vals = [1, 1] -> index 3
+        """
+        idx = 0
+        multiplier = 1
+        for p_val, p_name in zip(reversed(parent_vals), reversed(parent_names)):
+            idx += p_val * multiplier
+            multiplier *= self.domains[p_name]
+        return idx
+
+    def evaluate_state(
+        self,
+        row: list[tuple[int]],
+        signature_obj: ResponseSignature,
+        interventions: dict[str, int] | None = None,
+    ) -> dict[str, int]:
+        """
+        Flows the topological cascade to compute the state of all variables
+        under a specific set of interventions.
+
+        Args:
+            row: A list of tuples representing the function outputs for each node.
+            signature_obj: The ResponseSignature object defining the structure.
+            interventions: A dict of interventions to apply (e.g., {'X': 1}).
+
+        Returns:
+            dict[str, int]: The resulting state of all variables after applying interventions.
+        """
+        if interventions is None:
+            interventions = {}
+
+        state = {}
+        for i, node in enumerate(signature_obj.ordered_nodes):
+            if node in interventions:
+                # Override with intervention
+                state[node] = interventions[node]
+            else:
+                # Calculate from parents
+                parents = signature_obj.structure[node]
+                parent_vals = [state[p] for p in parents]
+                func_idx = self._get_function_index(parent_vals, parents)
+                state[node] = row[i][func_idx]
+        return state
+
+    def row_satisfies_query(
+        self,
+        row: list[tuple[int]],
+        signature_obj: ResponseSignature,
+        query: CausalQuery,
+    ) -> bool:
+        """
+        Checks if a specific signature row satisfies the entire CausalQuery.
+        Returns True if it matches evidence AND all counterfactuals.
+
+        Args:
+            row: A list of tuples representing the function outputs for each node.
+            signature_obj: The ResponseSignature object defining the structure.
+            query: The CausalQuery to evaluate against.
+
+        Returns:
+            bool: True if the row satisfies the query, False otherwise.
+        """
+        if query.evidence:
+            nat_state = self.evaluate_state(row, signature_obj, interventions={})
+            for e_var, e_val in query.evidence.items():
+                if nat_state[e_var] != e_val:
+                    return False
+
+        for atomic in query.counterfactuals:
+            # Ensure the query has been un-nested: interventions should be ints
+            for iv in atomic.interventions.values():
+                if not isinstance(iv, int):
+                    raise ValueError(
+                        "Nested interventions detected during evaluation. Call `CausalQuery.unnest(domains)` before evaluating or solving LPs."
+                    )
+
+            int_state = self.evaluate_state(
+                row, signature_obj, interventions=atomic.interventions
+            )
+
+            if int_state[atomic.target_var] != atomic.target_val:
+                return False
+
+        return True
 
 
 class ResponseSignature(ABC):
@@ -22,18 +140,63 @@ class ResponseSignature(ABC):
 
     def _generate_space(self):
         """Generates the Cartesian product of functional mappings based on the structure."""
+        self.space = list(self.iter_space())
+
+    def iter_space(self):
+        """Lazily iterate over the full signature space."""
         funcs_per_node = []
         for node in self.ordered_nodes:
             parents = self.structure[node]
             input_space_size = (
                 math.prod([self.domains[p] for p in parents]) if parents else 1
             )
-            node_funcs = list(
-                itertools.product(range(self.domains[node]), repeat=input_space_size)
+            node_funcs = itertools.product(
+                range(self.domains[node]), repeat=input_space_size
             )
             funcs_per_node.append(node_funcs)
 
-        self.space = list(itertools.product(*funcs_per_node))
+        yield from itertools.product(*funcs_per_node)
+
+    def get_equivalence_classes(
+        self, query: CausalQuery | CausalExpression
+    ) -> dict[tuple, int]:
+        """
+        Returns a dictionary of algebraic equivalence classes.
+        Key: (natural_state_tuple, numerator_coefficient, denominator_coefficient)
+        Value: Cardinality (number of response signatures belonging to this class)
+        """
+        equivalence_classes = {}
+        evaluator = SignatureQueryEvaluator(self.domains)
+
+        # Extract flat queries and evidence for coefficient evaluation
+        if isinstance(query, CausalExpression):
+            flat_expr = query
+            evidence_dict = list(query.terms.keys())[0].evidence if query.terms else {}
+        else:
+            flat_expr = CausalExpression({query: 1.0})
+            evidence_dict = query.evidence
+
+        evidence_query = CausalQuery(counterfactuals=[], evidence=evidence_dict)
+
+        # WARNING: Naive iteration. For large domains, this must be replaced
+        # with a symbolic counting algorithm to bypass self.iter_space().
+        for sig in self.iter_space():
+            nat_state = evaluator.evaluate_state(sig, self)
+            nat_tuple = tuple(nat_state[v] for v in self.ordered_nodes)
+
+            num_coeff = 0.0
+            for cq, w in flat_expr.terms.items():
+                if evaluator.row_satisfies_query(sig, self, cq):
+                    num_coeff += w
+
+            den_coeff = (
+                1.0 if evaluator.row_satisfies_query(sig, self, evidence_query) else 0.0
+            )
+
+            eq_key = (nat_tuple, num_coeff, den_coeff)
+            equivalence_classes[eq_key] = equivalence_classes.get(eq_key, 0) + 1
+
+        return equivalence_classes
 
     @property
     def size(self):
@@ -46,10 +209,14 @@ class ResponseSignature(ABC):
         return self.__str__()
 
     # ===============================================
-    # Graphical Visalisation
+    # Graph
     # ===============================================
 
-    def build_canonical_pscm(self):
+    def endogenous_structure(self) -> nx.DiGraph:
+        """Returns the endogenous structure as a networkx DiGraph."""
+        return nx.subgraph(self.build_canonical_pscm(), self.ordered_nodes)
+
+    def build_canonical_pscm(self) -> nx.DiGraph:
         """
         Constructs the canonical Partial SCM graph based on the structure.
         Each node has an edge from a single exogenous variable 'U' and edges from its
@@ -58,7 +225,6 @@ class ResponseSignature(ABC):
         Returns:
             A networkx DiGraph representing the canonical PSCM.
         """
-        import networkx as nx
 
         G = nx.DiGraph()
         node_positions = {
@@ -88,6 +254,34 @@ class ResponseSignature(ABC):
             G.add_edge("U", node, connectionstyle=f"arc3,rad={bend}", span=span)
 
         return G
+
+    def is_compatible(self, *queries: CausalQuery | CausalExpression) -> bool:
+        """Checks if the signature structure is compatible with the given queries."""
+        import networkx as nx
+
+        sig_graph = nx.subgraph(self.build_canonical_pscm(), self.ordered_nodes)
+        if not nx.is_directed_acyclic_graph(sig_graph):
+            raise ValueError("Signature structure must be a DAG.")
+
+        for query in queries:
+            induced_order = query.induced_order()
+            if not nx.is_directed_acyclic_graph(induced_order):
+                raise ValueError("Induced order from query must be a DAG.")
+
+            # All variables used by the query must exist in the signature
+            missing_nodes = set(induced_order.nodes()) - set(sig_graph.nodes())
+            if missing_nodes:
+                raise ValueError(
+                    f"Signature is missing variables required by query: {sorted(missing_nodes)}"
+                )
+
+            for u, v in induced_order.edges():
+                if not nx.has_path(sig_graph, u, v):
+                    raise ValueError(
+                        f"Signature is not compatible: requires a path {u} -> {v} but none exists in signature structure"
+                    )
+
+        return True
 
     def canonical_edge_connectionstyles(self) -> list[str]:
         """Return edge connection styles in graph edge order for curved drawing."""

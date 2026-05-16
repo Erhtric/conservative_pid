@@ -5,9 +5,14 @@ Tests cover:
 - CausalExpression: linear combinations, arithmetic operations, formatting
 """
 
+from matplotlib.pylab import isin
+
 import pytest
 from collections import defaultdict
 from cpid.io import AtomicCounterfactual, CausalQuery, CausalExpression
+import networkx as nx
+
+from cpid.signature import TotalOrderSignature
 
 
 class TestAtomicCounterfactual:
@@ -692,3 +697,32 @@ class TestIntegration:
 
     with pytest.raises(AttributeError):
         q.evidence = {"X": 1}
+
+
+class TestQueryOrdering:
+    def test_nde_construction(self):
+        domains = {"X": 2, "W": 2, "Y": 2}
+        nde_first_term = CausalQuery(
+            counterfactuals=[
+                AtomicCounterfactual(
+                    target_var="Y", target_val=0, interventions={"X": 1, "W": {"X": 0}}
+                ),
+            ]
+        )
+
+        nde_second_term = CausalQuery(
+            counterfactuals=[
+                AtomicCounterfactual(
+                    target_var="Y", target_val=0, interventions={"X": 0}
+                ),
+            ]
+        )
+
+        order = (nde_first_term - nde_second_term).induced_order()
+
+        assert isinstance(order, nx.DiGraph)
+        assert set(order.nodes) == {"X", "W", "Y"}
+        assert set(order.edges) == {("X", "W"), ("X", "Y"), ("W", "Y")}
+        assert list(nx.all_topological_sorts(order)) == [
+            ["X", "W", "Y"],
+        ]

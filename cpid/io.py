@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Union
+import networkx as nx
 
 
 @dataclass(frozen=True, repr=False)
@@ -98,9 +99,7 @@ class CausalQuery:
         evidence_items = tuple(sorted(self.evidence.items()))
         return hash((cf_tuple, evidence_items))
 
-    def unnest(
-        self, domains: Dict[str, int]
-    ) -> Union[CausalQuery, CausalExpression]:
+    def unnest(self, domains: Dict[str, int]) -> Union[CausalQuery, CausalExpression]:
         """
         Expand any nested interventions into a sum of standard atomic counterfactual
         queries using the law of total probability. For example,
@@ -182,6 +181,48 @@ class CausalQuery:
         terms = {q: 1.0 for q in expanded}
         return CausalExpression(terms)
 
+    def induced_order(self) -> nx.DiGraph:
+        """
+        Returns the induced partial order over variables implied by the counterfactuals in this query.
+        For example, P(Y_{X=1}=1) implies X < Y, while P(Y_{X_{Z=0}}=1) implies Z < X < Y.
+
+        Raises:
+            ValueError: If the induced order contains a cycle, which would indicate an ill-formed query.
+
+        Returns:
+            A directed acyclic graph (DAG) represented as a `networkx.DiGraph`, where an edge from A to B indicates that A is an intervention variable for B in at least
+        """
+        order = nx.DiGraph()
+        for cf in self.counterfactuals:
+            target = cf.target_var
+            order.add_node(target)
+            for int_var, int_val in cf.interventions.items():
+                if isinstance(int_val, dict):
+                    inner_query = CausalQuery(
+                        counterfactuals=[
+                            AtomicCounterfactual(
+                                target_var=int_var,
+                                target_val=-1,  # value doesn't matter
+                                interventions=int_val,
+                            )
+                        ],
+                        evidence={},
+                    )
+                    inner_order = inner_query.induced_order()
+                    order = nx.compose(order, inner_order)
+
+                order.add_edge(int_var, target)
+
+        for var in self.evidence.keys():
+            order.add_node(var)
+
+        try:
+            # Check for cycles and raise an error if found, since that would indicate an ill-formed query.
+            nx.find_cycle(order)
+            raise ValueError("Induced order contains a cycle.")
+        except nx.NetworkXNoCycle:
+            return order
+
     def __add__(self, other: Union[CausalQuery, CausalExpression]):
         if isinstance(other, CausalQuery):
             return CausalExpression({self: 1.0, other: 1.0})
@@ -212,10 +253,11 @@ class CausalQuery:
         return CausalExpression({self: -1.0})
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CausalExpression:
     """
     Represents a linear combination of `CausalQuery` objects.
+    Useful to compose and manipulate CausalQuery objects.
     """
 
     terms: Dict[CausalQuery, float] = field(default_factory=dict)
@@ -273,3 +315,25 @@ class CausalExpression:
         for q, w in self.terms.items():
             parts.append(f"{w:+g} * {q}")
         return " ".join(parts) or "0.0"
+
+    def induced_order(self) -> nx.DiGraph:
+        """
+        Returns the induced partial order over variables implied by the counterfactuals in all queries in this expression.
+        For example, P(Y_{X=1}=1) + P(Z_{Y=0}=1) implies X < Y and Y < Z.
+
+        Raises:
+            ValueError: If the induced order contains a cycle, which would indicate an ill-formed expression.
+
+        Returns:
+            A directed acyclic graph (DAG) represented as a `networkx.DiGraph`, where an edge from A to B indicates that A is an intervention variable for B in at least
+        """
+        order = nx.DiGraph()
+        for cq in self.terms.keys():
+            order = nx.compose(order, cq.induced_order())
+
+        try:
+            # Check for cycles and raise an error if found, since that would indicate an ill-formed query.
+            nx.find_cycle(order)
+            raise ValueError("Induced order contains a cycle.")
+        except nx.NetworkXNoCycle:
+            return order
