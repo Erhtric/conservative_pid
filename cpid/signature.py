@@ -13,18 +13,25 @@ class SignatureQueryEvaluator:
     def __init__(
         self,
         domains: dict[str, int],
-        signature_obj: ResponseSignature | None = None,
-        query: CausalQuery | CausalExpression | None = None,
+        signature_obj: ResponseSignature,
+        query: CausalQuery | CausalExpression,
     ):
+        """
+        Args:
+            domains: Dict mapping variable names to their number of discrete values.
+            signature_obj: A ResponseSignature object defining the signature space and structure.
+            query: A CausalQuery or CausalExpression to evaluate against the signature rows.
+
+        Raises:
+            ValueError: If the signature is not compatible with the query."""
         self.domains = domains
         self.signature = signature_obj
         self.query = query
 
-        if self.signature is not None and self.query is not None:
-            try:
-                self.signature.is_compatible(self.query)
-            except ValueError as e:
-                raise ValueError(f"Signature is not compatible with query: {e}")
+        try:
+            self.signature.is_compatible(self.query)
+        except ValueError as e:
+            raise ValueError(f"Signature is not compatible with query: {e}")
 
     def _get_function_index(
         self, parent_vals: list[int], parent_names: list[str]
@@ -343,6 +350,9 @@ class TotalOrderSignature(ResponseSignature):
         for i, node in enumerate(self.ordered_nodes):
             self.structure[node] = self.ordered_nodes[:i]
 
+    def __str__(self):
+        return f"TotalOrderSignature with order {self.ordered_nodes} and {self.size:,} functions"
+
 
 class PartialOrderSignature(ResponseSignature):
     """
@@ -391,3 +401,6 @@ class PartialOrderSignature(ResponseSignature):
             for o in outcomes:
                 self.structure[o] = list(current_parents)
                 current_parents.append(o)
+
+    def __str__(self):
+        return f"PartialOrderSignature with order {self.ordered_nodes} and {self.size:,} functions"

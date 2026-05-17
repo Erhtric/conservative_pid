@@ -223,6 +223,10 @@ class CausalQuery:
         except nx.NetworkXNoCycle:
             return order
 
+    def is_conditional(self) -> bool:
+        "Returns True if this query has any evidence variables (i.e. is a conditional query)."
+        return len(self.evidence) > 0
+
     def __add__(self, other: Union[CausalQuery, CausalExpression]):
         if isinstance(other, CausalQuery):
             return CausalExpression({self: 1.0, other: 1.0})
@@ -261,6 +265,14 @@ class CausalExpression:
     """
 
     terms: Dict[CausalQuery, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # All the terms must concord in their evidence
+        evidence_sets = [frozenset(cq.evidence.items()) for cq in self.terms.keys()]
+        if len(set(evidence_sets)) > 1:
+            raise ValueError(
+                f"All CausalQuery terms in a CausalExpression must have the same evidence. Found evidence sets: {evidence_sets}"
+            )
 
     @property
     def target_variables(self) -> List[str]:
