@@ -328,6 +328,14 @@ class CausalExpression:
             parts.append(f"{w:+g} * {q}")
         return " ".join(parts) or "0.0"
 
+    def is_conditional(self) -> bool:
+        "Returns True if this expression has any evidence variables (i.e. is a conditional query)."
+        if not self.terms:
+            return False
+        # All terms must have the same evidence, so we can just check the first one.
+        first_cq = next(iter(self.terms.keys()))
+        return len(first_cq.evidence) > 0
+
     def induced_order(self) -> nx.DiGraph:
         """
         Returns the induced partial order over variables implied by the counterfactuals in all queries in this expression.

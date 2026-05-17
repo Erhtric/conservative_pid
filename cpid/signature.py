@@ -1,77 +1,94 @@
 import itertools
 import math
 from abc import ABC, abstractmethod
+from typing import Callable
 from .io import CausalQuery, CausalExpression
 import networkx as nx
 
 
+def _compute_function_index(
+    parent_vals: list[int], parent_names: list[str], domains: dict[str, int]
+) -> int:
+    """Converts a tuple of parent values into a flat list index.
+
+    This utility function computes the index into a function lookup table given a
+    tuple of parent values. Uses big-endian ordering (rightmost variable is least significant).
+
+    Args:
+        parent_vals: A list of parent variable values (e.g., [0, 1]).
+        parent_names: A list of parent variable names in the same order as parent_vals (e.g., ['X', 'Z']).
+        domains: Dict mapping variable names to their domain sizes.
+
+    Returns:
+        An integer index corresponding to the combination of parent values.
+
+    Example:
+        For parent_names = ['X', 'Z'] and domains = {'X': 2, 'Z': 2}:
+        - parent_vals = [0, 0] -> index 0
+        - parent_vals = [0, 1] -> index 1
+        - parent_vals = [1, 0] -> index 2
+        - parent_vals = [1, 1] -> index 3
+    """
+    idx = 0
+    multiplier = 1
+    for p_val, p_name in zip(reversed(parent_vals), reversed(parent_names)):
+        idx += p_val * multiplier
+        multiplier *= domains[p_name]
+    return idx
+
+
 class SignatureQueryEvaluator:
     """
-    Evaluates whether a given signature row satisfies a CausalQuery.
+    Evaluates whether signature rows satisfy causal queries and observational constraints.
+
+    This class provides methods to:
+    - Evaluate the state of all variables under a given signature row and interventions
+    - Check if rows satisfy evidence constraints
+    - Filter rows by observational value tuples (natural state matching)
+    - Filter rows by causal query satisfaction (counterfactuals + evidence)
     """
 
     def __init__(
         self,
         domains: dict[str, int],
-        signature_obj: ResponseSignature,
-        query: CausalQuery | CausalExpression,
+        signature_obj: "ResponseSignature",
+        query: CausalQuery | CausalExpression | None = None,
     ):
-        """
+        """Initialize the evaluator.
+
         Args:
             domains: Dict mapping variable names to their number of discrete values.
             signature_obj: A ResponseSignature object defining the signature space and structure.
-            query: A CausalQuery or CausalExpression to evaluate against the signature rows.
+            query: Optional CausalQuery or CausalExpression to evaluate. If None, evaluator
+                   can still be used for state evaluation and evidence checking.
 
         Raises:
-            ValueError: If the signature is not compatible with the query."""
+            ValueError: If the signature is not compatible with the query (when query is provided).
+        """
         self.domains = domains
         self.signature = signature_obj
         self.query = query
 
-        try:
-            self.signature.is_compatible(self.query)
-        except ValueError as e:
-            raise ValueError(f"Signature is not compatible with query: {e}")
-
-    def _get_function_index(
-        self, parent_vals: list[int], parent_names: list[str]
-    ) -> int:
-        """Converts a tuple of parent values into a flat list index.
-
-        Args:
-            parent_vals: A list of parent variable values (e.g., [0, 1]).
-            parent_names: A list of parent variable names in the same order as parent_vals (e.g., ['X', 'Z']).
-
-        Returns:
-            An integer index corresponding to the combination of parent values.
-
-        Usage:
-            For example, if parent_names = ['X', 'Z'] and domains = {'X': 2, 'Z': 2}, then:
-            - parent_vals = [0, 0] -> index 0
-            - parent_vals = [0, 1] -> index 1
-            - parent_vals = [1, 0] -> index 2
-            - parent_vals = [1, 1] -> index 3
-        """
-        idx = 0
-        multiplier = 1
-        for p_val, p_name in zip(reversed(parent_vals), reversed(parent_names)):
-            idx += p_val * multiplier
-            multiplier *= self.domains[p_name]
-        return idx
+        if query is not None:
+            try:
+                self.signature.is_compatible(self.query)
+            except ValueError as e:
+                raise ValueError(f"Signature is not compatible with query: {e}")
 
     def evaluate_state(
         self,
         row: list[tuple[int]],
         interventions: dict[str, int] | None = None,
     ) -> dict[str, int]:
-        """
-        Flows the topological cascade to compute the state of all variables
-        under a specific set of interventions.
+        """Evaluate the state of all variables under a signature row and interventions.
+
+        Flows through the topological order, computing each variable's value either
+        from its function (if not intervened) or from the intervention value.
 
         Args:
             row: A list of tuples representing the function outputs for each node.
-            signature_obj: The ResponseSignature object defining the structure.
-            interventions: A dict of interventions to apply (e.g., {'X': 1}).
+            interventions: Optional dict of interventions to apply (e.g., {'X': 1}).
+                          If None, uses empty dict (pure observational state).
 
         Returns:
             dict[str, int]: The resulting state of all variables after applying interventions.
@@ -82,51 +99,56 @@ class SignatureQueryEvaluator:
         state = {}
         for i, node in enumerate(self.signature.ordered_nodes):
             if node in interventions:
-                # Override with intervention
                 state[node] = interventions[node]
             else:
-                # Calculate from parents
                 parents = self.signature.structure[node]
                 parent_vals = [state[p] for p in parents]
-                func_idx = self._get_function_index(parent_vals, parents)
+                func_idx = _compute_function_index(parent_vals, parents, self.domains)
                 state[node] = row[i][func_idx]
         return state
 
-    def row_satisfies_query(
-        self,
-        sig_row: list[tuple[int]],
-    ) -> bool:
-        """
-        Checks if a specific signature row satisfies the entire CausalQuery.
-        Returns True if it matches evidence AND all counterfactuals.
+    def _check_evidence(self, sig_row: list[tuple[int]]) -> bool:
+        """Check if a row satisfies the evidence constraints of the query.
 
         Args:
-            row: A list of tuples representing the function outputs for each node.
-            signature_obj: The ResponseSignature object defining the structure.
+            sig_row: A signature row.
 
         Returns:
-            bool: True if the row satisfies the query, False otherwise.
+            bool: True if there is no evidence, or if the natural state matches all evidence constraints.
         """
-        active_query = self.query
-        if active_query is None:
-            raise ValueError("No query provided to SignatureQueryEvaluator.")
-        if not isinstance(active_query, CausalQuery):
-            raise TypeError(
-                "SignatureQueryEvaluator.row_satisfies_query expects a CausalQuery."
-            )
+        if self.query is None or not hasattr(self.query, "evidence"):
+            return True
 
-        if active_query.evidence:
-            nat_state = self.evaluate_state(sig_row, interventions={})
-            for e_var, e_val in active_query.evidence.items():
-                if nat_state[e_var] != e_val:
-                    return False
+        if not self.query.evidence:
+            return True
 
-        for atomic in active_query.counterfactuals:
-            # Ensure the query has been un-nested: interventions should be ints
+        nat_state = self.evaluate_state(sig_row, interventions={})
+        return all(
+            nat_state[e_var] == e_val for e_var, e_val in self.query.evidence.items()
+        )
+
+    def _check_counterfactuals(self, sig_row: list[tuple[int]]) -> bool:
+        """Check if a row satisfies all counterfactual constraints of the query.
+
+        Args:
+            sig_row: A signature row.
+
+        Returns:
+            bool: True if all counterfactuals are satisfied.
+
+        Raises:
+            ValueError: If nested interventions are detected (query must be unnested first).
+        """
+        if self.query is None or not hasattr(self.query, "counterfactuals"):
+            return True
+
+        for atomic in self.query.counterfactuals:
+            # Validate interventions are unnested (all ints, not nested structures)
             for iv in atomic.interventions.values():
                 if not isinstance(iv, int):
                     raise ValueError(
-                        "Nested interventions detected during evaluation. Call `CausalQuery.unnest(domains)` before evaluating or solving LPs."
+                        "Nested interventions detected during evaluation. "
+                        "Call `CausalQuery.unnest(domains)` before evaluating or solving LPs."
                     )
 
             int_state = self.evaluate_state(sig_row, interventions=atomic.interventions)
@@ -134,6 +156,121 @@ class SignatureQueryEvaluator:
                 return False
 
         return True
+
+    def _filter_rows_by_predicate(
+        self, predicate: Callable[[list[tuple[int]]], bool]
+    ) -> list[int]:
+        """Filter signature rows using a custom predicate function.
+
+        This is the unified filtering mechanism used by specific query methods.
+
+        Args:
+            predicate: A function that takes a signature row and returns True if it should be included.
+
+        Returns:
+            list[int]: Indices of rows that satisfy the predicate.
+        """
+        matching_indices = []
+        for i, sig in enumerate(self.signature.space):
+            if predicate(sig):
+                matching_indices.append(i)
+        return matching_indices
+
+    def get_matching_row_indices(self, obs_vals: tuple[int]) -> list[int]:
+        """Return indices of signature rows with matching natural state (observational constraint).
+
+        Given observational values like (0, 0, 1) = P(X=0, W=0, Y=1), returns the indices
+        of all signature rows whose natural state (without interventions) matches these values.
+
+        Args:
+            obs_vals: A tuple of observed values (e.g., (0, 1, 0)).
+
+        Returns:
+            list[int]: Indices of signature rows whose natural state matches obs_vals.
+        """
+
+        def matches_obs(sig: list[tuple[int]]) -> bool:
+            nat_state = self.evaluate_state(sig, interventions={})
+            nat_tuple = tuple(nat_state[v] for v in self.signature.ordered_nodes)
+            return nat_tuple == obs_vals
+
+        return self._filter_rows_by_predicate(matches_obs)
+
+    def get_satisfying_row_indices(self, query_term: CausalQuery) -> list[int]:
+        """Return indices of signature rows that satisfy a CausalQuery.
+
+        A row satisfies a query if:
+        1. The natural state satisfies all evidence constraints (if any)
+        2. All counterfactual constraints are satisfied
+
+        Args:
+            query_term: A CausalQuery to check against each row.
+
+        Returns:
+            list[int]: Indices of signature rows satisfying the query_term.
+
+        Raises:
+            ValueError: If nested interventions are detected (query must be unnested first).
+        """
+
+        def satisfies_query(sig: list[tuple[int]]) -> bool:
+            # Check evidence first (fail fast)
+            if query_term.evidence:
+                nat_state = self.evaluate_state(sig, interventions={})
+                if not all(
+                    nat_state[e_var] == e_val
+                    for e_var, e_val in query_term.evidence.items()
+                ):
+                    return False
+
+            # Check all counterfactuals (fail fast on first mismatch)
+            for atomic in query_term.counterfactuals:
+                # Validate interventions are unnested
+                for iv in atomic.interventions.values():
+                    if not isinstance(iv, int):
+                        raise ValueError(
+                            "Nested interventions detected during evaluation. "
+                            "Call `CausalQuery.unnest(domains)` before evaluating or solving LPs."
+                        )
+
+                int_state = self.evaluate_state(sig, interventions=atomic.interventions)
+                if int_state[atomic.target_var] != atomic.target_val:
+                    return False
+
+            return True
+
+        return self._filter_rows_by_predicate(satisfies_query)
+
+    def row_satisfies_query(self, sig_row: list[tuple[int]]) -> bool:
+        """Check if a specific signature row satisfies the entire CausalQuery.
+
+        Returns True if:
+        1. Natural state satisfies all evidence constraints (if any)
+        2. All counterfactuals are satisfied
+
+        Args:
+            sig_row: A signature row.
+
+        Returns:
+            bool: True if the row satisfies the query, False otherwise.
+
+        Raises:
+            ValueError: If query is None or not a CausalQuery, or if nested interventions detected.
+            TypeError: If query is not a CausalQuery.
+        """
+        if self.query is None:
+            raise ValueError("No query provided to SignatureQueryEvaluator.")
+        if not isinstance(self.query, CausalQuery):
+            raise TypeError(
+                "row_satisfies_query expects a CausalQuery, not CausalExpression."
+            )
+
+        # Check evidence
+        if not self._check_evidence(sig_row):
+            return False
+
+        # Check counterfactuals
+        return self._check_counterfactuals(sig_row)
 
 
 class ResponseSignature(ABC):
@@ -174,12 +311,14 @@ class ResponseSignature(ABC):
     def get_equivalence_classes(
         self, query: CausalQuery | CausalExpression
     ) -> dict[tuple, int]:
-        """
-        Returns a dictionary of algebraic equivalence classes.
+        """Returns a dictionary of algebraic equivalence classes.
+
         Key: (natural_state_tuple, numerator_coefficient, denominator_coefficient)
         Value: Cardinality (number of response signatures belonging to this class)
         """
         equivalence_classes = {}
+
+        # Create an evaluator for state evaluation (no specific query needed)
         state_evaluator = SignatureQueryEvaluator(self.domains, signature_obj=self)
 
         # Extract flat queries and evidence for coefficient evaluation
