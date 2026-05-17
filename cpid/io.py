@@ -121,8 +121,6 @@ class CausalQuery:
         Returns:
             A `CausalQuery` if no nested interventions are present, or a `CausalExpression` representing the sum of expanded queries if nested interventions were found.
         """
-        # Worklist expansion: iteratively replace the first nested intervention
-        # found in each query until none remain.
         work = [self]
         expanded: List[CausalQuery] = []
 
@@ -173,9 +171,6 @@ class CausalQuery:
 
             if not found_nested:
                 expanded.append(cq)
-
-        if len(expanded) == 1:
-            return expanded[0]
 
         # combine into a CausalExpression with unit weights
         terms = {q: 1.0 for q in expanded}
@@ -280,6 +275,13 @@ class CausalExpression:
         for cq in self.terms.keys():
             for cf in cq.counterfactuals:
                 vars_set.add(cf.target_var)
+        return sorted(list(vars_set))
+
+    @property
+    def evidence_variables(self) -> List[str]:
+        vars_set: Set[str] = set()
+        for cq in self.terms.keys():
+            vars_set.update(cq.evidence.keys())
         return sorted(list(vars_set))
 
     @property

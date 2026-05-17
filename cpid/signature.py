@@ -1,3 +1,4 @@
+from orderly_set import OrderedSet, StableSet
 import itertools
 import math
 from abc import ABC, abstractmethod
@@ -163,6 +164,7 @@ class SignatureQueryEvaluator:
         """Filter signature rows using a custom predicate function.
 
         This is the unified filtering mechanism used by specific query methods.
+        Works with both materialized and lazy signatures.
 
         Args:
             predicate: A function that takes a signature row and returns True if it should be included.
@@ -171,7 +173,7 @@ class SignatureQueryEvaluator:
             list[int]: Indices of rows that satisfy the predicate.
         """
         matching_indices = []
-        for i, sig in enumerate(self.signature.space):
+        for i, sig in enumerate(self.signature._iterate_space()):
             if predicate(sig):
                 matching_indices.append(i)
         return matching_indices
@@ -276,22 +278,75 @@ class SignatureQueryEvaluator:
 class ResponseSignature(ABC):
     """
     Abstract base class for all response signatures.
+
+    Supports two modes of operation:
+    - Materialized mode (lazy=False, default): Entire signature space is materialized into self.space list.
+    - Lazy mode (lazy=True): Space is never materialized; only size is computed symbolically.
+      WARNING: In lazy mode, direct access to self.space will be None; use iter_space() instead.
     """
 
-    def __init__(self, domains: dict[str, int]):
+    def __init__(self, domains: dict[str, int], lazy: bool = False):
         self.domains: dict[str, int] = domains
         self.ordered_nodes: list[str] = []
         self.structure: dict[str, list[str]] = {}
-        self.space: list[tuple[int]] = []
+        self.space: list[tuple[int]] | None = [] if not lazy else None
+        self.lazy: bool = lazy
+        self._cached_size: int | None = None
 
     @abstractmethod
     def _build_structure(self):
         """Must be implemented by subclasses to define the topological parent mapping."""
         pass
 
+    @staticmethod
+    def _compute_space_size(
+        domains: dict[str, int], structure: dict[str, list[str]]
+    ) -> int:
+        """Compute the total signature space size symbolically without materialization.
+
+        For each node, the number of distinct functions from its parents to itself is:
+            |D(node)|^(|D(parent1)| * |D(parent2)| * ... * |D(parentN)|)
+
+        Total space size is the product over all nodes.
+
+        Args:
+            domains: Dict mapping variable names to their domain sizes.
+            structure: Dict mapping each variable to its list of parent variables.
+
+        Returns:
+            int: Total number of signatures in the space.
+
+        Example:
+            For 3 binary variables in total order [X, M, Y]:
+            - X has no parents: |D(X)|^1 = 2^1 = 2 functions
+            - M has parent X: |D(M)|^|D(X)| = 2^2 = 4 functions
+            - Y has parents X, M: |D(Y)|^(|D(X)|*|D(M)|) = 2^(2*2) = 2^4 = 16 functions
+            - Total: 2 * 4 * 16 = 128
+        """
+        total_size = 1
+        for node in structure.keys():
+            parents = structure[node]
+            if not parents:
+                # No parents: one function per domain value
+                num_functions = domains[node]
+            else:
+                # Number of input configurations (Cartesian product of parent domains)
+                input_space_size = math.prod(domains[p] for p in parents)
+                # Number of functions from inputs to this node's domain
+                num_functions = domains[node] ** input_space_size
+            total_size *= num_functions
+        return total_size
+
     def _generate_space(self):
-        """Generates the Cartesian product of functional mappings based on the structure."""
-        self.space = list(self.iter_space())
+        """Generates the Cartesian product of functional mappings based on the structure.
+
+        If lazy=True, skips materialization and caches size for symbolic computation.
+        If lazy=False, materializes entire space into self.space list.
+        """
+        if not self.lazy:
+            self.space = list(self.iter_space())
+        # Cache size for later retrieval
+        self._cached_size = self._compute_space_size(self.domains, self.structure)
 
     def iter_space(self):
         """Lazily iterate over the full signature space."""
@@ -308,17 +363,27 @@ class ResponseSignature(ABC):
 
         yield from itertools.product(*funcs_per_node)
 
+    def _iterate_space(self):
+        """Internal helper that returns materialized space if available, else lazy iterator.
+
+        Use this method internally when iterating over the space to support both lazy and materialized modes.
+
+        Returns:
+            Iterator over signature rows. In materialized mode, iterates over self.space list.
+            In lazy mode, yields from iter_space().
+        """
+        if self.space is not None:
+            # Materialized mode: iterate over cached list
+            return iter(self.space)
+        else:
+            # Lazy mode: iterate lazily
+            return self.iter_space()
+
     def get_equivalence_classes(
         self, query: CausalQuery | CausalExpression
-    ) -> dict[tuple, int]:
-        """Returns a dictionary of algebraic equivalence classes.
-
-        Key: (natural_state_tuple, numerator_coefficient, denominator_coefficient)
-        Value: Cardinality (number of response signatures belonging to this class)
-        """
+    ) -> dict[tuple[tuple[int], float], int]:
+        """Returns a dictionary of equivalence classes."""
         equivalence_classes = {}
-
-        # Create an evaluator for state evaluation (no specific query needed)
         state_evaluator = SignatureQueryEvaluator(self.domains, signature_obj=self)
 
         # Extract flat queries and evidence for coefficient evaluation
@@ -338,8 +403,6 @@ class ResponseSignature(ABC):
             self.domains, signature_obj=self, query=evidence_query
         )
 
-        # WARNING: Naive iteration. For large domains, this must be replaced
-        # with a symbolic counting algorithm to bypass self.iter_space().
         for sig in self.iter_space():
             nat_state = state_evaluator.evaluate_state(sig)
             nat_tuple = tuple(nat_state[v] for v in self.ordered_nodes)
@@ -357,8 +420,21 @@ class ResponseSignature(ABC):
         return equivalence_classes
 
     @property
-    def size(self):
-        return len(self.space)
+    def size(self) -> int:
+        """Return the total number of signatures in the space.
+
+        For materialized mode (lazy=False): returns len(self.space).
+        For lazy mode (lazy=True): returns cached symbolic computation.
+
+        Returns:
+            int: Total signatures, computed once at initialization.
+        """
+        if self._cached_size is not None:
+            return self._cached_size
+        if self.space is not None:
+            return len(self.space)
+        # Fallback: compute size if not yet cached (should not occur in normal flow)
+        return self._compute_space_size(self.domains, self.structure)
 
     def __str__(self):
         return f"ResponseSignature with {len(self.ordered_nodes)} nodes and {self.size:,} functions"
@@ -476,10 +552,17 @@ class ResponseSignature(ABC):
 class TotalOrderSignature(ResponseSignature):
     """
     Constructs a complete canonical signature space based on a strict total order.
+
+    Args:
+        domains: Dict mapping variable names to domain sizes.
+        total_order: List of variable names in topological order.
+        lazy: If True, skips space materialization (default: False).
     """
 
-    def __init__(self, domains: dict[str, int], total_order: list[str]):
-        super().__init__(domains)
+    def __init__(
+        self, domains: dict[str, int], total_order: list[str], lazy: bool = False
+    ):
+        super().__init__(domains, lazy=lazy)
         self.ordered_nodes: list[str] = total_order
         self._build_structure()
         self._generate_space()
@@ -497,49 +580,48 @@ class PartialOrderSignature(ResponseSignature):
     """
     Constructs a reduced signature space enforcing parallel roots (interventions)
     and a targets ordered by domain size.
+
+    Args:
+        domains: Dict mapping variable names to domain sizes.
+        query: CausalQuery or CausalExpression to build structure from.
+        lazy: If True, skips space materialization (default: False).
     """
 
-    def __init__(self, domains: dict[str, int], query: CausalQuery | CausalExpression):
-        super().__init__(domains)
+    def __init__(
+        self,
+        domains: dict[str, int],
+        query: CausalQuery | CausalExpression,
+        lazy: bool = False,
+    ):
+        super().__init__(domains, lazy=lazy)
         self.query: CausalQuery | CausalExpression = query
         self._build_structure()
         self._generate_space()
 
     def _build_structure(self):
         """Builds the structure based on the query's counterfactuals and evidence."""
+        induced_order = self.query.induced_order()
+        topo_nodes = list(
+            nx.lexicographical_topological_sort(
+                induced_order, key=lambda node: (self.domains[node], node)
+            )
+        )
+
+        roots = [node for node in topo_nodes if induced_order.in_degree(node) == 0]
+        outcomes = [node for node in topo_nodes if induced_order.in_degree(node) > 0]
+
+        self.ordered_nodes = roots + outcomes
+        self.structure = {node: [] for node in roots}
+
+        current_parents: list[str] = list(roots)
+        for node in outcomes:
+            self.structure[node] = list(current_parents)
+            current_parents.append(node)
+
         if isinstance(self.query, CausalQuery):
-            roots_set: set[str] = set()
-            for cf in self.query.counterfactuals:
-                roots_set.update(cf.interventions.keys())
-            # NOTE: observational evidence variables are also roots (?)
-            roots_set.update(self.query.evidence.keys())
-
-            roots = list(roots_set)
             print(f"Identified roots: {roots}")
-
-            outcomes = list({cf.target_var for cf in self.query.counterfactuals})
-            outcomes.sort(key=lambda v: self.domains[v])
-
-            self.ordered_nodes = roots + outcomes
-            self.structure = {r: [] for r in roots}
-
-            current_parents = list(roots)
-            for o in outcomes:
-                self.structure[o] = list(current_parents)
-                current_parents.append(o)
-
-        elif isinstance(self.query, CausalExpression):
-            target_vars = self.query.target_variables
-            intervention_vars = self.query.intervention_variables
-
-            roots = sorted(intervention_vars)
-            outcomes = sorted(target_vars, key=lambda v: self.domains[v])
-            self.ordered_nodes = roots + outcomes
-            self.structure = {r: [] for r in roots}
-            current_parents = list(roots)
-            for o in outcomes:
-                self.structure[o] = list(current_parents)
-                current_parents.append(o)
+        else:
+            print(f"Constructed structure: {self.structure}")
 
     def __str__(self):
         return f"PartialOrderSignature with order {self.ordered_nodes} and {self.size:,} functions"
