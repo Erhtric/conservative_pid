@@ -105,7 +105,6 @@ class OrderFunctionalLPSolver:
         return_lp: bool = False,
     ) -> tuple[float, float] | tuple[tuple[float, float], list[pulp.LpProblem]]:
         flat_expr = self._flatten_query_or_expr(self.query)
-        print(f"Evaluating query: {flat_expr}")
 
         bounds = []
         pulp_probs = []
@@ -181,9 +180,6 @@ class OrderFunctionalLPSolver:
                     constraint_expr = [
                         q_vars[i] for i in matching_indices_per_obs[obs_vals]
                     ]
-                    print(
-                        f"Adding observational constraint for obs_vals {obs_vals} with prob {obs_prob} and matching indices {matching_indices_per_obs[obs_vals]}"
-                    )
                     prob += pulp.lpSum(constraint_expr) == obs_prob
 
                 prob += pulp.lpSum(q_vars.values()) == 1.0
@@ -192,13 +188,8 @@ class OrderFunctionalLPSolver:
                 obj_terms = []
                 for cq, w in flat_expr.terms.items():
                     satisfying_indices = satisfying_indices_per_term[cq]
-                    print(
-                        f"Adding objective terms for query {cq} with weight {w} and satisfying indices {satisfying_indices}"
-                    )
                     for i in satisfying_indices:
                         obj_terms.append(w * q_vars[i])
-
-                print(f"Adding objective with {obj_terms} terms.")
 
                 prob += pulp.lpSum(obj_terms)
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))

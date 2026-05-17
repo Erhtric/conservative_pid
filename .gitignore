@@ -12,3 +12,8 @@ wheels/
 bib/
 .github/
 .DS_Store
+
+uv.lock
+
+.vscode/
+.pytest_cache/

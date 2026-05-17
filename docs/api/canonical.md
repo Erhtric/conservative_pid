@@ -1,4 +1,0 @@
-
-# Canonical Module
-
-::: src.canonical

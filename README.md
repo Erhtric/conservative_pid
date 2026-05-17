@@ -1,47 +1,19 @@
 # Conservative PID
 
-Conservative PID is a Python library for causal inference, providing tools to define symbolic causal models, generate canonical bases (deterministic worlds), and compute bounds on causal queries using Linear Programming.
+Conservative PID is a Python library for partial identification under minimal assumptions.
 
-## Features
-
-- **Symbolic Causal Language**: Define variables, interventions (`@`), and counterfactual terms naturally.
-- **Canonical Basis Generation**: transform variables and domains into a set of all possible deterministic worlds.
-  - Includes a highly optimized, vectorized implementation using NumPy.
-- **Solver**: Compute strict Lower and Upper bounds for causal queries (Standard and Conditional) given observational data.
-
-## Getting Started
-
-### Installation
-
-This project uses `uv` for dependency management.
+## Install
 
 ```bash
 uv sync
 ```
 
-### Running Tests
+## Notebook
 
-```bash
-uv run python -m pytest tests/
-```
+See [notebooks/lib_exploration.ipynb](notebooks/lib_exploration.ipynb) for a walkthrough focused on instantiating the solver and exploring query bounds.
 
-## Documentation
+## Project Layout
 
-This project uses `mkdocs` for documentation. To view the documentation locally:
-
-1.  **Install dependencies** (if not done):
-    ```bash
-    uv sync
-    ```
-
-2.  **Serve the documentation**:
-    ```bash
-    uv run mkdocs serve
-    ```
-    Open your browser at `http://127.0.0.1:8000` to view the site.
-
-3.  **Build static site**:
-    ```bash
-    uv run mkdocs build
-    ```
-    The static HTML files will be generated in the `site/` directory.
+- [cpid/io.py](cpid/io.py): counterfactual and query data structures (pseudo-symbolic formulation)
+- [cpid/signature.py](cpid/signature.py): signatures and query compatibility methods
+- [cpid/lp.py](cpid/lp.py): linear-programming solver

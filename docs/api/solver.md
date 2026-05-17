@@ -1,4 +1,0 @@
-
-# Solver Module
-
-::: src.solver
