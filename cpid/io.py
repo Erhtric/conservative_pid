@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Union
 import networkx as nx
 
 
@@ -22,7 +21,7 @@ class AtomicCounterfactual:
     # a dict describing a nested intervention whose inner interventions
     # should be resolved by un-nesting before evaluation. For example
     # {'Z': 0} represents an inner intervention placeholder.
-    interventions: Dict[str, Union[int, Dict[str, int]]] = field(default_factory=dict)
+    interventions: dict[str, int | dict[str, int]] = field(default_factory=dict)
 
     def __str__(self):
         int_str = ", ".join(f"{k}={v}" for k, v in self.interventions.items())
@@ -72,12 +71,12 @@ class CausalQuery:
     ```
     """
 
-    counterfactuals: List[AtomicCounterfactual]
-    evidence: Dict[str, int] = field(default_factory=dict)
+    counterfactuals: list[AtomicCounterfactual]
+    evidence: dict[str, int] = field(default_factory=dict)
 
     @property
-    def all_variables(self) -> List[str]:
-        vars_set: Set[str] = set()
+    def all_variables(self) -> list[str]:
+        vars_set: set[str] = set()
         for cf in self.counterfactuals:
             vars_set.add(cf.target_var)
             vars_set.update(cf.interventions.keys())
@@ -99,7 +98,7 @@ class CausalQuery:
         evidence_items = tuple(sorted(self.evidence.items()))
         return hash((cf_tuple, evidence_items))
 
-    def unnest(self, domains: Dict[str, int]) -> Union[CausalQuery, CausalExpression]:
+    def unnest(self, domains: dict[str, int]) -> CausalQuery | CausalExpression:
         """
         Expand any nested interventions into a sum of standard atomic counterfactual
         queries using the law of total probability. For example,
@@ -122,7 +121,7 @@ class CausalQuery:
             A `CausalQuery` if no nested interventions are present, or a `CausalExpression` representing the sum of expanded queries if nested interventions were found.
         """
         work = [self]
-        expanded: List[CausalQuery] = []
+        expanded: list[CausalQuery] = []
 
         while work:
             cq = work.pop()
@@ -222,7 +221,7 @@ class CausalQuery:
         "Returns True if this query has any evidence variables (i.e. is a conditional query)."
         return len(self.evidence) > 0
 
-    def __add__(self, other: Union[CausalQuery, CausalExpression]):
+    def __add__(self, other: CausalQuery | CausalExpression):
         if isinstance(other, CausalQuery):
             return CausalExpression({self: 1.0, other: 1.0})
         if isinstance(other, CausalExpression):
@@ -231,7 +230,7 @@ class CausalQuery:
             return CausalExpression(terms)
         return NotImplemented
 
-    def __sub__(self, other: Union[CausalQuery, CausalExpression]):
+    def __sub__(self, other: CausalQuery | CausalExpression):
         if isinstance(other, CausalQuery):
             return CausalExpression({self: 1.0, other: -1.0})
         if isinstance(other, CausalExpression):
@@ -259,7 +258,7 @@ class CausalExpression:
     Useful to compose and manipulate CausalQuery objects.
     """
 
-    terms: Dict[CausalQuery, float] = field(default_factory=dict)
+    terms: dict[CausalQuery, float] = field(default_factory=dict)
 
     def __post_init__(self):
         # All the terms must concord in their evidence
@@ -270,29 +269,29 @@ class CausalExpression:
             )
 
     @property
-    def target_variables(self) -> List[str]:
-        vars_set: Set[str] = set()
+    def target_variables(self) -> list[str]:
+        vars_set: set[str] = set()
         for cq in self.terms.keys():
             for cf in cq.counterfactuals:
                 vars_set.add(cf.target_var)
         return sorted(list(vars_set))
 
     @property
-    def evidence_variables(self) -> List[str]:
-        vars_set: Set[str] = set()
+    def evidence_variables(self) -> list[str]:
+        vars_set: set[str] = set()
         for cq in self.terms.keys():
             vars_set.update(cq.evidence.keys())
         return sorted(list(vars_set))
 
     @property
-    def intervention_variables(self) -> List[str]:
-        vars_set: Set[str] = set()
+    def intervention_variables(self) -> list[str]:
+        vars_set: set[str] = set()
         for cq in self.terms.keys():
             for cf in cq.counterfactuals:
                 vars_set.update(cf.interventions.keys())
         return sorted(list(vars_set))
 
-    def __add__(self, other: Union[CausalQuery, CausalExpression]):
+    def __add__(self, other: CausalQuery | CausalExpression):
         new_terms = self.terms.copy()
         if isinstance(other, CausalQuery):
             new_terms[other] = new_terms.get(other, 0.0) + 1.0
@@ -305,7 +304,7 @@ class CausalExpression:
         new_terms = {q: w for q, w in new_terms.items() if w != 0}
         return CausalExpression(new_terms)
 
-    def __sub__(self, other: Union[CausalQuery, CausalExpression]):
+    def __sub__(self, other: CausalQuery | CausalExpression):
         if isinstance(other, CausalQuery):
             return self + CausalExpression({other: -1.0})
         if isinstance(other, CausalExpression):

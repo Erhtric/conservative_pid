@@ -2,7 +2,7 @@ from orderly_set import OrderedSet, StableSet
 import itertools
 import math
 from abc import ABC, abstractmethod
-from typing import Callable
+from collections.abc import Callable
 from .io import CausalQuery, CausalExpression
 import networkx as nx
 
@@ -78,18 +78,19 @@ class SignatureQueryEvaluator:
 
     def evaluate_state(
         self,
-        row: list[tuple[int]],
+        row: tuple[tuple[int, ...], ...],
         interventions: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Evaluate the state of all variables under a signature row and interventions.
 
         Flows through the topological order, computing each variable's value either
-        from its function (if not intervened) or from the intervention value.
+        from its function (if not intervened) or from the intervention value. It
+        equals to the iterative application of the composition axiom for the given signature row.
 
         Args:
             row: A list of tuples representing the function outputs for each node.
             interventions: Optional dict of interventions to apply (e.g., {'X': 1}).
-                          If None, uses empty dict (pure observational state).
+                If None, uses empty dict (pure observational state).
 
         Returns:
             dict[str, int]: The resulting state of all variables after applying interventions.
@@ -108,7 +109,7 @@ class SignatureQueryEvaluator:
                 state[node] = row[i][func_idx]
         return state
 
-    def _check_evidence(self, sig_row: list[tuple[int]]) -> bool:
+    def _check_evidence(self, sig_row: tuple[tuple[int, ...], ...]) -> bool:
         """Check if a row satisfies the evidence constraints of the query.
 
         Args:
@@ -128,7 +129,7 @@ class SignatureQueryEvaluator:
             nat_state[e_var] == e_val for e_var, e_val in self.query.evidence.items()
         )
 
-    def _check_counterfactuals(self, sig_row: list[tuple[int]]) -> bool:
+    def _check_counterfactuals(self, sig_row: tuple[tuple[int, ...], ...]) -> bool:
         """Check if a row satisfies all counterfactual constraints of the query.
 
         Args:
@@ -159,7 +160,7 @@ class SignatureQueryEvaluator:
         return True
 
     def _filter_rows_by_predicate(
-        self, predicate: Callable[[list[tuple[int]]], bool]
+        self, predicate: Callable[[tuple[tuple[int, ...], ...]], bool]
     ) -> list[int]:
         """Filter signature rows using a custom predicate function.
 
@@ -191,7 +192,7 @@ class SignatureQueryEvaluator:
             list[int]: Indices of signature rows whose natural state matches obs_vals.
         """
 
-        def matches_obs(sig: list[tuple[int]]) -> bool:
+        def matches_obs(sig: tuple[tuple[int, ...], ...]) -> bool:
             nat_state = self.evaluate_state(sig, interventions={})
             nat_tuple = tuple(nat_state[v] for v in self.signature.ordered_nodes)
             return nat_tuple == obs_vals
@@ -215,7 +216,7 @@ class SignatureQueryEvaluator:
             ValueError: If nested interventions are detected (query must be unnested first).
         """
 
-        def satisfies_query(sig: list[tuple[int]]) -> bool:
+        def satisfies_query(sig: tuple[tuple[int, ...], ...]) -> bool:
             # Check evidence first (fail fast)
             if query_term.evidence:
                 nat_state = self.evaluate_state(sig, interventions={})
@@ -243,7 +244,7 @@ class SignatureQueryEvaluator:
 
         return self._filter_rows_by_predicate(satisfies_query)
 
-    def row_satisfies_query(self, sig_row: list[tuple[int]]) -> bool:
+    def row_satisfies_query(self, sig_row: tuple[tuple[int, ...], ...]) -> bool:
         """Check if a specific signature row satisfies the entire CausalQuery.
 
         Returns True if:
@@ -267,11 +268,9 @@ class SignatureQueryEvaluator:
                 "row_satisfies_query expects a CausalQuery, not CausalExpression."
             )
 
-        # Check evidence
         if not self._check_evidence(sig_row):
             return False
 
-        # Check counterfactuals
         return self._check_counterfactuals(sig_row)
 
 
@@ -381,12 +380,10 @@ class ResponseSignature(ABC):
 
     def get_equivalence_classes(
         self, query: CausalQuery | CausalExpression
-    ) -> dict[tuple[tuple[int], float], int]:
-        """Returns a dictionary of equivalence classes."""
-        equivalence_classes = {}
-        state_evaluator = SignatureQueryEvaluator(self.domains, signature_obj=self)
+    ) -> dict[tuple[tuple[int, ...], float, float], int]:
+        """Retrieve query-relevant equivalence classes of signatures using an MDD."""
+        from .mdd import ResponseSignatureMDD
 
-        # Extract flat queries and evidence for coefficient evaluation
         if isinstance(query, CausalExpression):
             flat_expr = query
             evidence_dict = list(query.terms.keys())[0].evidence if query.terms else {}
@@ -394,30 +391,25 @@ class ResponseSignature(ABC):
             flat_expr = CausalExpression({query: 1.0})
             evidence_dict = query.evidence
 
-        evidence_query = CausalQuery(counterfactuals=[], evidence=evidence_dict)
-        query_evaluators = [
-            (SignatureQueryEvaluator(self.domains, signature_obj=self, query=cq), w)
-            for cq, w in flat_expr.terms.items()
-        ]
-        evidence_evaluator = SignatureQueryEvaluator(
-            self.domains, signature_obj=self, query=evidence_query
+        # Context 0 is always the natural context {}
+        contexts = [{}]
+        context_map = {frozenset(): 0}
+
+        for cq in flat_expr.terms.keys():
+            for atomic in cq.counterfactuals:
+                frozen_int = frozenset(atomic.interventions.items())
+                if frozen_int not in context_map:
+                    context_map[frozen_int] = len(contexts)
+                    contexts.append(atomic.interventions)
+
+        mdd = ResponseSignatureMDD(
+            domains=self.domains,
+            ordered_nodes=self.ordered_nodes,
+            structure=self.structure,
+            contexts=contexts,
         )
-
-        for sig in self.iter_space():
-            nat_state = state_evaluator.evaluate_state(sig)
-            nat_tuple = tuple(nat_state[v] for v in self.ordered_nodes)
-
-            num_coeff = 0.0
-            for evaluator, w in query_evaluators:
-                if evaluator.row_satisfies_query(sig):
-                    num_coeff += w
-
-            den_coeff = 1.0 if evidence_evaluator.row_satisfies_query(sig) else 0.0
-
-            eq_key = (nat_tuple, num_coeff, den_coeff)
-            equivalence_classes[eq_key] = equivalence_classes.get(eq_key, 0) + 1
-
-        return equivalence_classes
+        mdd.build()
+        return mdd.get_equivalence_classes(flat_expr, evidence_dict, context_map)
 
     @property
     def size(self) -> int:
@@ -553,6 +545,9 @@ class TotalOrderSignature(ResponseSignature):
     """
     Constructs a complete canonical signature space based on a strict total order.
 
+    Note:
+    - This is the baseline signature and most expressive one. Mostly not used.
+
     Args:
         domains: Dict mapping variable names to domain sizes.
         total_order: List of variable names in topological order.
@@ -580,6 +575,10 @@ class PartialOrderSignature(ResponseSignature):
     """
     Constructs a reduced signature space enforcing parallel roots (interventions)
     and a targets ordered by domain size.
+
+    Note:
+    - This signature is designed to be compatible with any query. The signature structure
+    is built from the query induced order.
 
     Args:
         domains: Dict mapping variable names to domain sizes.
@@ -617,11 +616,6 @@ class PartialOrderSignature(ResponseSignature):
         for node in outcomes:
             self.structure[node] = list(current_parents)
             current_parents.append(node)
-
-        if isinstance(self.query, CausalQuery):
-            print(f"Identified roots: {roots}")
-        else:
-            print(f"Constructed structure: {self.structure}")
 
     def __str__(self):
         return f"PartialOrderSignature with order {self.ordered_nodes} and {self.size:,} functions"

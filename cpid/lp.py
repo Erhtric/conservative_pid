@@ -43,7 +43,6 @@ class OrderFunctionalLPSolver:
         self.solver_verbose = solver_verbose
 
         query = self._flatten_query_or_expr(query)
-        print(f"Flattened query/expression: {query}")
 
         if order:
             if not set(order).issubset(vars_in_data):
@@ -51,7 +50,6 @@ class OrderFunctionalLPSolver:
                 raise ValueError(
                     f"Provided order contains variables not in data: {missing}"
                 )
-            print(f"Using provided variable order: {order}")
             self.signature_obj = TotalOrderSignature(
                 domains=self.domains, total_order=order, lazy=lazy
             )
@@ -73,7 +71,6 @@ class OrderFunctionalLPSolver:
                 domains=self.domains, query=query, lazy=lazy
             )
 
-        print(self.signature_obj.ordered_nodes)
         self.data_dist = (
             data[
                 self.signature_obj.ordered_nodes
@@ -83,6 +80,12 @@ class OrderFunctionalLPSolver:
         )
 
         self.query = query
+
+        # General information for debugging
+        print(f"Initialized OrderFunctionalLPSolver with:")
+        print(f"  Query: {self.query}")
+        print(f"  Domains: {self.domains}")
+        print(f"  Signature: {self.signature_obj}")
 
     def _flatten_query_or_expr(
         self, qobj: CausalQuery | CausalExpression
@@ -110,7 +113,24 @@ class OrderFunctionalLPSolver:
         self,
         return_lp: bool = False,
     ) -> tuple[float, float] | tuple[tuple[float, float], list[pulp.LpProblem]]:
+        """
+        Solves the LP to compute bounds for the query.
 
+        For conditional queries, applies the Charnes-Cooper transformation to convert the fractional program into a
+        linear one. Constructs the LP constraints based on the equivalence classes derived from the MDD paths,
+        ensuring that the solution space is correctly defined by the observed data distribution and the query structure.
+
+        Args:
+            return_lp: If True, also return the raw LP problem objects for inspection.
+
+        Returns:
+            A tuple of (lower_bound, upper_bound) for the query, and optionally the list of LP problem objects.
+        """
+
+        # Group signature rows into equivalence class:
+        # Observational consistency
+        # Numerator consistency (satisfies same query terms)
+        # Denominator consistency (satisfies evidence if conditional)
         eq_classes = self.signature_obj.get_equivalence_classes(self.query)
 
         bounds = []
@@ -123,136 +143,196 @@ class OrderFunctionalLPSolver:
         for sense in [pulp.LpMinimize, pulp.LpMaximize]:
             prob: pulp.LpProblem = pulp.LpProblem("Partial_ID", sense)
 
-            q_vars: dict[int, pulp.LpVariable] = pulp.LpVariable.dicts(
-                "q", range(len(eq_classes)), lowBound=0, upBound=1
-            )
+            if self.query.is_conditional():
+                print(
+                    "Detected conditional query. Applying Charnes-Cooper transformation."
+                )
 
-            for obs_vals, obs_prob in self.data_dist.items():
-                matching_classes = [
-                    eq_class_to_idx[key] for key in eq_class_keys if key[0] == obs_vals
+                y_vars: dict[int, pulp.LpVariable] = pulp.LpVariable.dicts(
+                    "y", range(len(eq_classes)), lowBound=0
+                )
+                t = pulp.LpVariable("t", lowBound=0)
+
+                for obs_vals, obs_prob in self.data_dist.items():
+                    matching_classes = [
+                        eq_class_to_idx[key]
+                        for key in eq_class_keys
+                        if key[0] == obs_vals
+                    ]
+                    if matching_classes:
+                        prob += (
+                            pulp.lpSum([y_vars[i] for i in matching_classes])
+                            - obs_prob * t
+                            == 0
+                        )
+
+                prob += pulp.lpSum(y_vars.values()) - t == 0
+
+                # Denominator constraint leverages the computed coefficients (key[2] is den_coeff)
+                denom_terms = [
+                    key[2] * y_vars[eq_class_to_idx[key]]
+                    for key in eq_class_keys
+                    if key[2] > 0
                 ]
-                constraint_expr = [q_vars[i] for i in matching_classes]
-                prob += pulp.lpSum(constraint_expr) == obs_prob
-            prob += pulp.lpSum(q_vars.values()) == 1.0
+                prob += pulp.lpSum(denom_terms) == 1.0
 
-            # Objective Function
-            obj_terms = [
-                key[1] * q_vars[eq_class_to_idx[key]]
-                for key in eq_class_keys
-                if key[1] != 0
-            ]
-            prob += pulp.lpSum(obj_terms)
-            prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
-            bounds.append(pulp.value(prob.objective))
-            pulp_probs.append(prob)
+                # Objective Function (key[1] is num_coeff)
+                obj_terms = [
+                    key[1] * y_vars[eq_class_to_idx[key]]
+                    for key in eq_class_keys
+                    if key[1] != 0
+                ]
+                prob += pulp.lpSum(obj_terms)
 
-        # for q_var in prob.variables():
-        #     print(f"{q_var.name} = {q_var.varValue}")
+                prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
+                bounds.append(pulp.value(prob.objective))
+                pulp_probs.append(prob)
+
+            else:
+                q_vars: dict[int, pulp.LpVariable] = pulp.LpVariable.dicts(
+                    "q", range(len(eq_classes)), lowBound=0, upBound=1
+                )
+
+                for obs_vals, obs_prob in self.data_dist.items():
+                    matching_classes = [
+                        eq_class_to_idx[key]
+                        for key in eq_class_keys
+                        if key[0] == obs_vals
+                    ]
+                    if matching_classes:
+                        prob += (
+                            pulp.lpSum([q_vars[i] for i in matching_classes])
+                            == obs_prob
+                        )
+
+                prob += pulp.lpSum(q_vars.values()) == 1.0
+
+                # Objective Function (key[1] is num_coeff)
+                obj_terms = [
+                    key[1] * q_vars[eq_class_to_idx[key]]
+                    for key in eq_class_keys
+                    if key[1] != 0
+                ]
+
+                prob += pulp.lpSum(obj_terms)
+                prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
+                bounds.append(pulp.value(prob.objective))
+                pulp_probs.append(prob)
+
         if return_lp:
             return tuple(bounds), pulp_probs
 
         return tuple(bounds)
 
-    # def __call__(
-    #     self,
-    #     return_lp: bool = False,
-    # ) -> tuple[float, float] | tuple[tuple[float, float], list[pulp.LpProblem]]:
-    #     bounds = []
-    #     pulp_probs = []
-    #     evaluator = SignatureQueryEvaluator(
-    #         self.domains, self.signature_obj, self.query
-    #     )
+    def compute_bounds_explicit(
+        self,
+        return_lp: bool = False,
+    ) -> tuple[float, float] | tuple[tuple[float, float], list[pulp.LpProblem]]:
+        """
+        Explicitly constructs the LP using the full path enumeration from the MDD, without pre-grouping into equivalence classes.
 
-    #     matching_indices_per_obs = {
-    #         obs_vals: evaluator.get_matching_row_indices(obs_vals)
-    #         for obs_vals in self.data_dist.keys()
-    #     }
+        Args:
+            return_lp: If True, also return the raw LP problem objects for inspection.
 
-    #     satisfying_indices_per_term = {
-    #         cq: evaluator.get_satisfying_row_indices(cq)
-    #         for cq in self.query.terms.keys()
-    #     }
+        Returns:
+            A tuple of (lower_bound, upper_bound) for the query, and optionally the list of LP problem objects.
+        """
+        bounds = []
+        pulp_probs = []
+        evaluator = SignatureQueryEvaluator(
+            self.domains, self.signature_obj, self.query
+        )
 
-    #     denom_indices = None
-    #     if self.query.is_conditional():
-    #         evidence_dict = {}
-    #         if isinstance(self.query, CausalExpression):
-    #             # Extract evidence from first term (they should all have same evidence)
-    #             for cq, _ in self.query.terms.items():
-    #                 evidence_dict = cq.evidence if cq.evidence else {}
-    #                 break
+        matching_indices_per_obs = {
+            obs_vals: evaluator.get_matching_row_indices(obs_vals)
+            for obs_vals in self.data_dist.keys()
+        }
 
-    #         if evidence_dict:
-    #             evidence_query = CausalQuery(counterfactuals=[], evidence=evidence_dict)
-    #             denom_indices = evaluator.get_satisfying_row_indices(evidence_query)
-    #         else:
-    #             denom_indices = list(range(self.signature_obj.size))
+        satisfying_indices_per_term = {
+            cq: evaluator.get_satisfying_row_indices(cq)
+            for cq in self.query.terms.keys()
+        }
 
-    #     for sense in [pulp.LpMinimize, pulp.LpMaximize]:
-    #         prob: pulp.LpProblem = pulp.LpProblem("Partial_ID", sense)
+        denom_indices = None
+        if self.query.is_conditional():
+            evidence_dict = {}
+            if isinstance(self.query, CausalExpression):
+                # Extract evidence from first term (they should all have same evidence)
+                for cq, _ in self.query.terms.items():
+                    evidence_dict = cq.evidence if cq.evidence else {}
+                    break
 
-    #         if self.query.is_conditional():
-    #             print(
-    #                 "Detected conditional query. Applying Charnes-Cooper transformation."
-    #             )
-    #             # Conditional query: apply Charnes-Cooper transformation.
-    #             # Variables: y_i (for each world) and scalar t >= 0
-    #             y_vars = pulp.LpVariable.dicts(
-    #                 "y", range(self.signature_obj.size), lowBound=0
-    #             )
-    #             t = pulp.LpVariable("t", lowBound=0)
+            if evidence_dict:
+                evidence_query = CausalQuery(counterfactuals=[], evidence=evidence_dict)
+                denom_indices = evaluator.get_satisfying_row_indices(evidence_query)
+            else:
+                denom_indices = list(range(self.signature_obj.size))
 
-    #             # Observational constraints scaled by t: sum_{i in matching} y_i - obs_prob * t == 0
-    #             for obs_vals, obs_prob in self.data_dist.items():
-    #                 constraint_expr = [
-    #                     y_vars[i] for i in matching_indices_per_obs[obs_vals]
-    #                 ]
-    #                 prob += pulp.lpSum(constraint_expr) - obs_prob * t == 0
+        for sense in [pulp.LpMinimize, pulp.LpMaximize]:
+            prob: pulp.LpProblem = pulp.LpProblem("Partial_ID", sense)
 
-    #             # Simplex constraint transformed: sum_i y_i - t == 0
-    #             prob += pulp.lpSum(y_vars.values()) - t == 0
+            if self.query.is_conditional():
+                print(
+                    "Detected conditional query. Applying Charnes-Cooper transformation."
+                )
+                # Conditional query: apply Charnes-Cooper transformation.
+                # Variables: y_i (for each world) and scalar t >= 0
+                y_vars = pulp.LpVariable.dicts(
+                    "y", range(self.signature_obj.size), lowBound=0
+                )
+                t = pulp.LpVariable("t", lowBound=0)
 
-    #             # Denominator constraint: d^T y == 1
-    #             prob += pulp.lpSum([y_vars[i] for i in denom_indices]) == 1.0
+                # Observational constraints scaled by t: sum_{i in matching} y_i - obs_prob * t == 0
+                for obs_vals, obs_prob in self.data_dist.items():
+                    constraint_expr = [
+                        y_vars[i] for i in matching_indices_per_obs[obs_vals]
+                    ]
+                    prob += pulp.lpSum(constraint_expr) - obs_prob * t == 0
 
-    #             # Objective: c^T y where c picks rows satisfying numerator (gamma ∧ delta)
-    #             obj_terms = []
-    #             for cq, w in self.query.terms.items():
-    #                 for i in satisfying_indices_per_term[cq]:
-    #                     obj_terms.append(w * y_vars[i])
+                # Simplex constraint transformed: sum_i y_i - t == 0
+                prob += pulp.lpSum(y_vars.values()) - t == 0
 
-    #             prob += pulp.lpSum(obj_terms)
-    #             prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
-    #             bounds.append(pulp.value(prob.objective))
-    #             pulp_probs.append(prob)
-    #         else:
-    #             q_vars: dict[int, pulp.LpVariable] = pulp.LpVariable.dicts(
-    #                 "q", range(self.signature_obj.size), lowBound=0, upBound=1
-    #             )
-    #             for obs_vals, obs_prob in self.data_dist.items():
-    #                 constraint_expr = [
-    #                     q_vars[i] for i in matching_indices_per_obs[obs_vals]
-    #                 ]
-    #                 prob += pulp.lpSum(constraint_expr) == obs_prob
+                # Denominator constraint: d^T y == 1
+                prob += pulp.lpSum([y_vars[i] for i in denom_indices]) == 1.0
 
-    #             prob += pulp.lpSum(q_vars.values()) == 1.0
+                # Objective: c^T y where c picks rows satisfying numerator (gamma ∧ delta)
+                obj_terms = []
+                for cq, w in self.query.terms.items():
+                    for i in satisfying_indices_per_term[cq]:
+                        obj_terms.append(w * y_vars[i])
 
-    #             # Objective Function
-    #             obj_terms = []
-    #             for cq, w in self.query.terms.items():
-    #                 satisfying_indices = satisfying_indices_per_term[cq]
-    #                 for i in satisfying_indices:
-    #                     obj_terms.append(w * q_vars[i])
+                prob += pulp.lpSum(obj_terms)
+                prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
+                bounds.append(pulp.value(prob.objective))
+                pulp_probs.append(prob)
+            else:
+                q_vars: dict[int, pulp.LpVariable] = pulp.LpVariable.dicts(
+                    "q", range(self.signature_obj.size), lowBound=0, upBound=1
+                )
+                for obs_vals, obs_prob in self.data_dist.items():
+                    constraint_expr = [
+                        q_vars[i] for i in matching_indices_per_obs[obs_vals]
+                    ]
+                    prob += pulp.lpSum(constraint_expr) == obs_prob
 
-    #             prob += pulp.lpSum(obj_terms)
-    #             prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
-    #             bounds.append(pulp.value(prob.objective))
-    #             pulp_probs.append(prob)
+                prob += pulp.lpSum(q_vars.values()) == 1.0
 
-    #     if return_lp:
-    #         return tuple(bounds), pulp_probs
+                # Objective Function
+                obj_terms = []
+                for cq, w in self.query.terms.items():
+                    satisfying_indices = satisfying_indices_per_term[cq]
+                    for i in satisfying_indices:
+                        obj_terms.append(w * q_vars[i])
 
-    #     return tuple(bounds)
+                prob += pulp.lpSum(obj_terms)
+                prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
+                bounds.append(pulp.value(prob.objective))
+                pulp_probs.append(prob)
+
+        if return_lp:
+            return tuple(bounds), pulp_probs
+
+        return tuple(bounds)
 
     def __str__(self):
         return f"""OrderFunctionalLPSolver:
