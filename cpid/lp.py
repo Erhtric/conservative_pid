@@ -81,12 +81,6 @@ class OrderFunctionalLPSolver:
 
         self.query = query
 
-        # General information for debugging
-        print(f"Initialized OrderFunctionalLPSolver with:")
-        print(f"  Query: {self.query}")
-        print(f"  Domains: {self.domains}")
-        print(f"  Signature: {self.signature_obj}")
-
     def _flatten_query_or_expr(
         self, qobj: CausalQuery | CausalExpression
     ) -> CausalExpression:

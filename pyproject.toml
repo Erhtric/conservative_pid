@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "networkx>=3.6.1",
     "numpy>=2.4.1",
+    "orderly-set>=5.5.0",
     "pandas>=3.0.0",
     "pgmpy>=1.0.0",
     "pulp>=3.3.0",

@@ -1,4 +1,3 @@
-from orderly_set import OrderedSet, StableSet
 import itertools
 import math
 from abc import ABC, abstractmethod
@@ -378,6 +377,33 @@ class ResponseSignature(ABC):
             # Lazy mode: iterate lazily
             return self.iter_space()
 
+    def _retrieve_intervention_contexts(
+        self, flat_expr: CausalExpression
+    ) -> tuple[list[dict[str, int]], dict[frozenset, int]]:
+        """
+        Extracts all unique intervention contexts from a CausalExpression.
+
+        Empty context {} is always included as the natural observational context.
+
+        Args:
+            flat_expr: A CausalExpression representing the query.
+
+        Returns:
+            Tuple of unique intervention contexts and a mapping from frozensets to context indices.
+        """
+        # Context 0 is always the natural context {}
+        contexts = [{}]
+        context_map = {frozenset(): 0}
+
+        for cq in flat_expr.terms.keys():
+            for atomic in cq.counterfactuals:
+                frozen_int = frozenset(atomic.interventions.items())
+                if frozen_int not in context_map:
+                    context_map[frozen_int] = len(contexts)
+                    contexts.append(atomic.interventions)
+
+        return contexts, context_map
+
     def get_equivalence_classes(
         self, query: CausalQuery | CausalExpression
     ) -> dict[tuple[tuple[int, ...], float, float], int]:
@@ -391,17 +417,10 @@ class ResponseSignature(ABC):
             flat_expr = CausalExpression({query: 1.0})
             evidence_dict = query.evidence
 
-        # Context 0 is always the natural context {}
-        contexts = [{}]
-        context_map = {frozenset(): 0}
+        contexts, context_map = self._retrieve_intervention_contexts(flat_expr)
 
-        for cq in flat_expr.terms.keys():
-            for atomic in cq.counterfactuals:
-                frozen_int = frozenset(atomic.interventions.items())
-                if frozen_int not in context_map:
-                    context_map[frozen_int] = len(contexts)
-                    contexts.append(atomic.interventions)
-
+        # Build and traverse the MDD to get equivalence classes
+        # This should be efficient even for large signature spaces
         mdd = ResponseSignatureMDD(
             domains=self.domains,
             ordered_nodes=self.ordered_nodes,
@@ -409,7 +428,13 @@ class ResponseSignature(ABC):
             contexts=contexts,
         )
         mdd.build()
-        return mdd.get_equivalence_classes(flat_expr, evidence_dict, context_map)
+        eq_classes = mdd.get_equivalence_classes(
+            flat_expr=flat_expr,
+            evidence_dict=evidence_dict,
+            context_map=context_map,
+        )
+        print(f"Generated {len(eq_classes)} equivalence classes for the query.")
+        return eq_classes
 
     @property
     def size(self) -> int:

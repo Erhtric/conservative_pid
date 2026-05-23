@@ -86,3 +86,22 @@ def test_partial_order_signature_from_expression():
     for out in ["C", "D"]:
         for r in ["A", "B"]:
             assert r in sig.structure[out]
+
+
+def test_partial_order_signature_from_nested_expression_has_no_repeated_structure():
+    domains = {"X": 2, "Y": 2, "Z": 2}
+    nested_cf = AtomicCounterfactual(
+        target_var="Y", target_val=1, interventions={"X": {"Z": 0}}
+    )
+    nested_query = CausalQuery(counterfactuals=[nested_cf])
+
+    expr = nested_query.unnest(domains)
+    sig = PartialOrderSignature(domains, expr)
+
+    assert sig.ordered_nodes == ["Z", "X", "Y"]
+    assert sig.structure["Z"] == []
+    assert sig.structure["X"] == ["Z"]
+    assert sig.structure["Z"] == []
+    assert sig.structure["Y"] == ["Z", "X"]
+    assert len(sig.structure["Y"]) == len(set(sig.structure["Y"]))
+    assert len(sig.ordered_nodes) == len(set(sig.ordered_nodes))
