@@ -172,35 +172,47 @@ class ResponseSignatureMDD:
         flat_expr: CausalExpression,
         evidence_dict: dict[str, int],
         context_map: dict[frozenset, int],
-    ) -> dict[tuple[tuple[int, ...], float, float], int]:
+        experimental_exprs: list[CausalExpression] | None = None,
+    ) -> dict[tuple, int]:
         """
         Each MDD leaf is associated to a signature row. We tests that tuple against the query:
         1. extract the natural config (under empty intervention)
         2. check if the path satisfies the query evidence (denominator)
         3. check if the path satisfies the query counterfactual conditions (numerator)
-        4. aggregate counts of paths that share the same (nat_tuple, num_coeff, den_coeff) signature into equivalence classes.
+        4. (Optional) Evaluate experimental constraints to further split the equivalence classes.
+        5. aggregate counts of paths that share the same key into equivalence classes.
         """
-        equivalence_classes: dict[tuple[tuple[int, ...], float, float], int] = {}
+        equivalence_classes: dict[tuple, int] = {}
+        if experimental_exprs is None:
+            experimental_exprs = []
 
         node_to_idx = {node: i for i, node in enumerate(self.ordered_nodes)}
         num_nodes = len(self.ordered_nodes)
 
         query_ev = [(node_to_idx[v], val) for v, val in evidence_dict.items()]
 
-        term_meta = []
-        for cq, w in flat_expr.terms.items():
-            ev_pairs = [(node_to_idx[v], val) for v, val in cq.evidence.items()]
-            atomics = []
-            for atomic in cq.counterfactuals:
-                ctx_idx = context_map[frozenset(atomic.interventions.items())]
+        def _get_term_meta(expr: CausalExpression):
+            """
+            Helper function to extract the evidence and counterfactual conditions from a causal expression term.
+                - For evidence, we create a list of (node_idx, value) pairs.
+                - For counterfactuals, we create a list of (context_idx, node_idx, value) tuples, where context_idx is derived from the intervention set using the context_map.
+            """
+            meta = []
+            for cq, w in expr.terms.items():
+                ev_pairs = [(node_to_idx[v], val) for v, val in cq.evidence.items()]
+                atomics = []
+                for atomic in cq.counterfactuals:
+                    ctx_idx = context_map[frozenset(atomic.interventions.items())]
+                    atomics.append(
+                        (ctx_idx, node_to_idx[atomic.target_var], atomic.target_val)
+                    )
+                meta.append((ev_pairs, atomics, w))
+            return meta
 
-                atomics.append(
-                    (ctx_idx, node_to_idx[atomic.target_var], atomic.target_val)
-                )
+        query_meta = _get_term_meta(flat_expr)
+        exp_meta_list = [_get_term_meta(expr) for expr in experimental_exprs]
 
-            term_meta.append((ev_pairs, atomics, w))
-
-        # Evaluate paths against query conditions to determine equivalence classes
+        # Evaluate paths against query and experimental conditions
         for path_tuple, count in self.paths.items():
             # Natural context
             nat_tuple = tuple(path_tuple[i][0] for i in range(num_nodes))
@@ -212,18 +224,24 @@ class ResponseSignatureMDD:
 
             # Numerator: gamma \land delta check across all terms
             num_coeff = 0.0
-            for ev_pairs, atomics, w in term_meta:
-                # Evidence check (context 0)
-                if not all(path_tuple[idx][0] == val for idx, val in ev_pairs):
-                    continue
-
-                # Counterfactual check (possibly other contexts)
-                if all(
+            for ev_pairs, atomics, w in query_meta:
+                if all(path_tuple[idx][0] == val for idx, val in ev_pairs) and all(
                     path_tuple[idx][ctx_idx] == val for ctx_idx, idx, val in atomics
                 ):
                     num_coeff += w
 
-            eq_key = (nat_tuple, num_coeff, den_coeff)
+            # Experimental evaluations
+            exp_evals = []
+            for exp_meta in exp_meta_list:
+                val = 0.0
+                for ev_pairs, atomics, w in exp_meta:
+                    if all(path_tuple[idx][0] == val for idx, val in ev_pairs) and all(
+                        path_tuple[idx][ctx_idx] == val for ctx_idx, idx, val in atomics
+                    ):
+                        val += w
+                exp_evals.append(val)
+
+            eq_key = (nat_tuple, num_coeff, den_coeff, *exp_evals)
             equivalence_classes[eq_key] = equivalence_classes.get(eq_key, 0) + count
 
         return equivalence_classes

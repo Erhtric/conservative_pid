@@ -42,7 +42,7 @@ class OrderFunctionalLPSolver:
 
         self.solver_verbose = solver_verbose
 
-        query = self._flatten_query_or_expr(query)
+        query = self._flatten_query_or_expr(query, self.domains)
 
         if order:
             if not set(order).issubset(vars_in_data):
@@ -79,15 +79,54 @@ class OrderFunctionalLPSolver:
             .to_dict()
         )
 
+        # Experimental/interventional constraints provided by user.
+        self.experimental_constraints: dict[CausalExpression, float] = {}
+
         self.query = query
 
+    def add_experimental_constraint(
+        self, target_expr: CausalQuery | CausalExpression, value: float
+    ):
+        """
+        Adds an experimental constraint to the LP. The target_expr identifies symbolically
+        the causal quantity being constrained.
+
+        Args:
+            target_expr: A CausalQuery or CausalExpression representing the causal quantity to constrain.
+            value: The numerical value that the target_expr is constrained to equal.
+
+        """
+        expr = self._flatten_query_or_expr(target_expr, self.domains)
+        if isinstance(expr, CausalQuery):
+            expr = CausalExpression({expr: 1.0})
+
+        # Validate compatibility of each inner query with the signature
+        for cq in expr.terms.keys():
+            try:
+                # signature_obj exposes compatibility checks used elsewhere
+                self.signature_obj.is_compatible(cq)
+            except Exception as e:
+                raise ValueError(
+                    f"Experimental constraint not compatible with signature: {e}"
+                )
+
+        self.experimental_constraints[expr] = value
+
+    def add_monotonicity_constraint(self):
+        pass
+
+    def add_exogeneity_constraint(self):
+        pass
+
+    @staticmethod
     def _flatten_query_or_expr(
-        self, qobj: CausalQuery | CausalExpression
+        qobj: CausalQuery | CausalExpression,
+        domains: dict[str, int],
     ) -> CausalExpression:
         """Return a CausalExpression representing the (possibly unnested) linear combination."""
         if isinstance(qobj, CausalQuery):
             print(f"Unnesting query {qobj}")
-            u = qobj.unnest(self.domains)
+            u = qobj.unnest(domains)
             if isinstance(u, CausalQuery):
                 return CausalExpression({u: 1.0})
             return u
@@ -95,7 +134,7 @@ class OrderFunctionalLPSolver:
         terms: dict[CausalQuery, float] = {}
         for cq, w in qobj.terms.items():
             print(f"Unnesting term {cq} with weight {w}")
-            u = cq.unnest(self.domains)
+            u = cq.unnest(domains)
             if isinstance(u, CausalQuery):
                 terms[u] = terms.get(u, 0.0) + w
             else:  # CausalExpression
@@ -125,12 +164,16 @@ class OrderFunctionalLPSolver:
         # Observational consistency
         # Numerator consistency (satisfies same query terms)
         # Denominator consistency (satisfies evidence if conditional)
-        eq_classes = self.signature_obj.get_equivalence_classes(self.query)
+        # Experimental consistency (satisfies each experimental constraint, split correctly)
+        eq_classes = self.signature_obj.get_equivalence_classes(
+            self.query,
+            experimental_constraints=[expr for expr in self.experimental_constraints],
+        )
 
         bounds = []
         pulp_probs = []
 
-        # Create mapping from equivalence class keys to indices for LP variables
+        # Mapping for PuLP variable indexing
         eq_class_keys = list(eq_classes.keys())
         eq_class_to_idx = {key: idx for idx, key in enumerate(eq_class_keys)}
 
@@ -155,12 +198,15 @@ class OrderFunctionalLPSolver:
                     ]
                     if matching_classes:
                         prob += (
-                            pulp.lpSum([y_vars[i] for i in matching_classes])
-                            - obs_prob * t
-                            == 0
+                            (
+                                pulp.lpSum([y_vars[i] for i in matching_classes])
+                                - obs_prob * t
+                                == 0
+                            ),
+                            "Obs_Constraint_" + str(obs_vals),
                         )
 
-                prob += pulp.lpSum(y_vars.values()) - t == 0
+                prob += pulp.lpSum(y_vars.values()) - t == 0, "Simplex_Constraint"
 
                 # Denominator constraint leverages the computed coefficients (key[2] is den_coeff)
                 denom_terms = [
@@ -168,7 +214,7 @@ class OrderFunctionalLPSolver:
                     for key in eq_class_keys
                     if key[2] > 0
                 ]
-                prob += pulp.lpSum(denom_terms) == 1.0
+                prob += pulp.lpSum(denom_terms) == 1.0, "Denominator_Constraint"
 
                 # Objective Function (key[1] is num_coeff)
                 obj_terms = [
@@ -176,7 +222,19 @@ class OrderFunctionalLPSolver:
                     for key in eq_class_keys
                     if key[1] != 0
                 ]
-                prob += pulp.lpSum(obj_terms)
+                prob += pulp.lpSum(obj_terms), "Objective"
+
+                # Add Experimental Constraints (key[3+i] is evaluating the i-th experiment)
+                for i, (expr, val) in enumerate(self.experimental_constraints.items()):
+                    exp_terms = [
+                        key[3 + i] * y_vars[eq_class_to_idx[key]]
+                        for key in eq_class_keys
+                        if key[3 + i] != 0
+                    ]
+                    prob += (
+                        pulp.lpSum(exp_terms) - float(val) * t == 0,
+                        "Exp_Constraint_" + str(expr),
+                    )
 
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
                 bounds.append(pulp.value(prob.objective))
@@ -195,11 +253,14 @@ class OrderFunctionalLPSolver:
                     ]
                     if matching_classes:
                         prob += (
-                            pulp.lpSum([q_vars[i] for i in matching_classes])
-                            == obs_prob
+                            (
+                                pulp.lpSum([q_vars[i] for i in matching_classes])
+                                == obs_prob
+                            ),
+                            "Obs_Constraint_" + str(obs_vals),
                         )
 
-                prob += pulp.lpSum(q_vars.values()) == 1.0
+                prob += pulp.lpSum(q_vars.values()) == 1.0, "Simplex_Constraint"
 
                 # Objective Function (key[1] is num_coeff)
                 obj_terms = [
@@ -208,7 +269,20 @@ class OrderFunctionalLPSolver:
                     if key[1] != 0
                 ]
 
-                prob += pulp.lpSum(obj_terms)
+                prob += pulp.lpSum(obj_terms), "Objective"
+
+                # Add Experimental Constraints (key[3+i] is evaluating the i-th experiment)
+                for i, (expr, val) in enumerate(self.experimental_constraints.items()):
+                    exp_terms = [
+                        key[3 + i] * q_vars[eq_class_to_idx[key]]
+                        for key in eq_class_keys
+                        if key[3 + i] != 0
+                    ]
+                    prob += (
+                        pulp.lpSum(exp_terms) == float(val),
+                        "Exp_Constraint_" + str(expr),
+                    )
+
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
                 bounds.append(pulp.value(prob.objective))
                 pulp_probs.append(prob)
@@ -223,7 +297,8 @@ class OrderFunctionalLPSolver:
         return_lp: bool = False,
     ) -> tuple[float, float] | tuple[tuple[float, float], list[pulp.LpProblem]]:
         """
-        Explicitly constructs the LP using the full path enumeration from the MDD, without pre-grouping into equivalence classes.
+        Explicitly constructs the LP by materialising the entire signature space. This works
+        but it is not scalable. Useful to understand the mechanics of the LP formulation and for debugging on small examples.
 
         Args:
             return_lp: If True, also return the raw LP problem objects for inspection.
@@ -269,7 +344,6 @@ class OrderFunctionalLPSolver:
                 print(
                     "Detected conditional query. Applying Charnes-Cooper transformation."
                 )
-                # Conditional query: apply Charnes-Cooper transformation.
                 # Variables: y_i (for each world) and scalar t >= 0
                 y_vars = pulp.LpVariable.dicts(
                     "y", range(self.signature_obj.size), lowBound=0
@@ -281,13 +355,22 @@ class OrderFunctionalLPSolver:
                     constraint_expr = [
                         y_vars[i] for i in matching_indices_per_obs[obs_vals]
                     ]
-                    prob += pulp.lpSum(constraint_expr) - obs_prob * t == 0
+                    prob += (
+                        pulp.lpSum(constraint_expr) - obs_prob * t == 0,
+                        "Obs_Constraint_" + str(obs_vals),
+                    )
 
                 # Simplex constraint transformed: sum_i y_i - t == 0
-                prob += pulp.lpSum(y_vars.values()) - t == 0
+                prob += (
+                    pulp.lpSum(y_vars.values()) - t == 0,
+                    "Simplex_Constraint",
+                )
 
                 # Denominator constraint: d^T y == 1
-                prob += pulp.lpSum([y_vars[i] for i in denom_indices]) == 1.0
+                prob += (
+                    pulp.lpSum([y_vars[i] for i in denom_indices]) == 1.0,
+                    "Denominator_Constraint",
+                )
 
                 # Objective: c^T y where c picks rows satisfying numerator (gamma ∧ delta)
                 obj_terms = []
@@ -295,7 +378,23 @@ class OrderFunctionalLPSolver:
                     for i in satisfying_indices_per_term[cq]:
                         obj_terms.append(w * y_vars[i])
 
-                prob += pulp.lpSum(obj_terms)
+                prob += (
+                    pulp.lpSum(obj_terms),
+                    "Objective",
+                )
+
+                # Apply any experimental constraints: each is a CausalExpression -> value
+                for expr, val in self.experimental_constraints.items():
+                    expr_terms = []
+                    for cq, w in expr.terms.items():
+                        indices = evaluator.get_satisfying_row_indices(cq)
+                        for i in indices:
+                            expr_terms.append(w * y_vars[i])
+                    # Charnes-Cooper scaled constraint: sum(w*y_i) == val * t
+                    prob += (
+                        pulp.lpSum(expr_terms) - float(val) * t == 0,
+                        "Exp_Constraint_" + str(expr),
+                    )
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
                 bounds.append(pulp.value(prob.objective))
                 pulp_probs.append(prob)
@@ -307,9 +406,15 @@ class OrderFunctionalLPSolver:
                     constraint_expr = [
                         q_vars[i] for i in matching_indices_per_obs[obs_vals]
                     ]
-                    prob += pulp.lpSum(constraint_expr) == obs_prob
+                    prob += (
+                        pulp.lpSum(constraint_expr) == obs_prob,
+                        "Obs_Constraint_" + str(obs_vals),
+                    )
 
-                prob += pulp.lpSum(q_vars.values()) == 1.0
+                prob += (
+                    pulp.lpSum(q_vars.values()) == 1.0,
+                    "Simplex_Constraint",
+                )
 
                 # Objective Function
                 obj_terms = []
@@ -318,7 +423,22 @@ class OrderFunctionalLPSolver:
                     for i in satisfying_indices:
                         obj_terms.append(w * q_vars[i])
 
-                prob += pulp.lpSum(obj_terms)
+                prob += (
+                    pulp.lpSum(obj_terms),
+                    "Objective",
+                )
+
+                # Apply any experimental constraints for unconditional case
+                for expr, val in self.experimental_constraints.items():
+                    expr_terms = []
+                    for cq, w in expr.terms.items():
+                        indices = evaluator.get_satisfying_row_indices(cq)
+                        for i in indices:
+                            expr_terms.append(w * q_vars[i])
+                    prob += (
+                        pulp.lpSum(expr_terms) == float(val),
+                        "Exp_Constraint_" + str(expr),
+                    )
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
                 bounds.append(pulp.value(prob.objective))
                 pulp_probs.append(prob)

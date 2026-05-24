@@ -2,6 +2,39 @@ import pyagrum as gum
 from cpid import AtomicCounterfactual, CausalQuery
 from cpid import OrderFunctionalLPSolver
 import pandas as pd
+import numpy as np
+import itertools
+
+
+def generate_canonical_tian_df(
+    domains: dict[str, int] = {"X": 2, "Y": 2},
+    seed: int = 42,
+    sample_size: int = 10000,
+    include_counterfactuals: bool = True,
+) -> pd.DataFrame:
+    np.random.seed(seed)
+
+    dx = domains["X"]
+    dy = domains["Y"]
+    num_functions = dy**dx
+
+    # Sample the marginal exogenous distributions P(X) and P(U_Y)
+    p_x = np.random.dirichlet(np.ones(dx))
+    X = np.random.choice(range(dx), size=sample_size, p=p_x)
+
+    p_uy = np.random.dirichlet(np.ones(num_functions))
+    Uy = np.random.choice(range(num_functions), size=sample_size, p=p_uy)
+    response_table = np.array(list(itertools.product(range(dy), repeat=dx)))
+
+    Y = response_table[Uy, X]
+
+    df = pd.DataFrame({"X": X, "Y": Y})
+
+    if include_counterfactuals:
+        for x_val in range(dx):
+            df[f"Y_{{X={x_val}}}"] = response_table[Uy, x_val]
+
+    return df
 
 
 def generate_tian_df(

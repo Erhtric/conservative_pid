@@ -406,15 +406,15 @@ class ResponseSignature(ABC):
 
     @staticmethod
     def _retrieve_intervention_contexts(
-        flat_expr: CausalExpression,
+        *exprs: CausalExpression,
     ) -> tuple[list[dict[str, int]], dict[frozenset, int]]:
         """
-        Extracts all unique intervention contexts from a CausalExpression.
+        Extracts all unique intervention contexts from one or more CausalExpressions.
 
         Empty context {} is always included as the natural observational context.
 
         Args:
-            flat_expr: A CausalExpression representing the query.
+            *exprs: One or more CausalExpression objects representing the query and experiments.
 
         Returns:
             Tuple of unique intervention contexts and a mapping from frozensets to context indices.
@@ -424,24 +424,31 @@ class ResponseSignature(ABC):
         contexts = [{}]
         context_map = {frozenset(): 0}
 
-        for cq in flat_expr.terms.keys():
-            for atomic in cq.counterfactuals:
-                try:
-                    frozen_int = frozenset(atomic.interventions.items())
-                    if frozen_int not in context_map:
-                        context_map[frozen_int] = len(contexts)
-                        contexts.append(atomic.interventions)
-                except TypeError:
-                    raise ValueError(
-                        "Nested interventions detected; the method shall be called on a unnested CausalExpression. Call `CausalExpression.unnest(domains)` before passing to this method."
-                    )
+        for expr in exprs:
+            for cq in expr.terms.keys():
+                for atomic in cq.counterfactuals:
+                    try:
+                        frozen_int = frozenset(atomic.interventions.items())
+                        if frozen_int not in context_map:
+                            context_map[frozen_int] = len(contexts)
+                            contexts.append(atomic.interventions)
+                    except TypeError:
+                        raise ValueError(
+                            "Nested interventions detected; the method shall be called on a unnested CausalExpression. Call `CausalExpression.unnest(domains)` before passing to this method."
+                        )
 
         return contexts, context_map
 
     def get_equivalence_classes(
-        self, query: CausalQuery | CausalExpression
-    ) -> dict[tuple[tuple[int, ...], float, float], int]:
-        """Retrieve query-relevant equivalence classes of signatures using an MDD."""
+        self,
+        query: CausalQuery | CausalExpression,
+        experimental_constraints: list[CausalExpression] | None = None,
+    ) -> dict[tuple, int]:
+        """Retrieve query-relevant equivalence classes of signatures using an MDD.
+
+        The equivalence class key is expanded to include evaluations for any experimental
+        constraints, ensuring that states are split correctly for the LP solver.
+        """
         from .mdd import ResponseSignatureMDD
 
         if isinstance(query, CausalExpression):
@@ -451,13 +458,15 @@ class ResponseSignature(ABC):
             flat_expr = CausalExpression({query: 1.0})
             evidence_dict = query.evidence
 
-        # Get interventions assignments and their multiplicities within the query.
+        if experimental_constraints is None:
+            experimental_constraints = []
+
+        # Get intervention assignments from both query and experimental constraints.
         contexts, context_map = ResponseSignature._retrieve_intervention_contexts(
-            flat_expr
+            flat_expr, *experimental_constraints
         )
 
         # Build and traverse the MDD to get equivalence classes
-        # This should be efficient even for large signature spaces
         mdd = ResponseSignatureMDD(
             domains=self.domains,
             ordered_nodes=self.ordered_nodes,
@@ -469,8 +478,9 @@ class ResponseSignature(ABC):
             flat_expr=flat_expr,
             evidence_dict=evidence_dict,
             context_map=context_map,
+            experimental_exprs=experimental_constraints,
         )
-        print(f"Generated {len(eq_classes)} equivalence classes for the query.")
+        print(f"Generated {len(eq_classes)} equivalence classes.")
         return eq_classes
 
     def __str__(self):
