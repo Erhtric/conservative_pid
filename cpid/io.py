@@ -329,6 +329,11 @@ class CausalExpression:
             parts.append(f"{w:+g} * {q}")
         return " ".join(parts) or "0.0"
 
+    def __hash__(self):
+        # Since dicts aren't hashable, we convert the terms dict to a frozenset of (query, weight) pairs.
+        terms_frozenset = frozenset(self.terms.items())
+        return hash(terms_frozenset)
+
     def is_conditional(self) -> bool:
         "Returns True if this expression has any evidence variables (i.e. is a conditional query)."
         if not self.terms:
