@@ -71,7 +71,7 @@ class SignatureQueryEvaluator:
 
         if query is not None:
             try:
-                self.signature.is_compatible(self.query)
+                self.signature.is_compatible(query)
             except ValueError as e:
                 raise ValueError(f"Signature is not compatible with query: {e}")
 
@@ -120,7 +120,7 @@ class SignatureQueryEvaluator:
         if self.query is None or not hasattr(self.query, "evidence"):
             return True
 
-        if not self.query.evidence:
+        if not isinstance(self.query.evidence, dict) or not self.query.evidence:
             return True
 
         nat_state = self.evaluate_state(sig_row, interventions={})
@@ -276,14 +276,16 @@ class SignatureQueryEvaluator:
 class ResponseSignature(ABC):
     """
     Abstract base class for all response signatures.
-
-    Supports two modes of operation:
-    - Materialized mode (lazy=False, default): Entire signature space is materialized into self.space list.
-    - Lazy mode (lazy=True): Space is never materialized; only size is computed symbolically.
-      WARNING: In lazy mode, direct access to self.space will be None; use iter_space() instead.
     """
 
     def __init__(self, domains: dict[str, int], lazy: bool = False):
+        """
+        Args:
+            domains: Dict mapping variable names to their number of discrete values.
+            lazy: If True, skips materialization of the signature space (default: False).
+                  In lazy mode, self.space will be None and size is computed symbolically.
+                  In lazy mode, direct access to self.space will be None; use iter_space() instead.
+        """
         self.domains: dict[str, int] = domains
         self.ordered_nodes: list[str] = []
         self.structure: dict[str, list[str]] = {}
@@ -295,6 +297,10 @@ class ResponseSignature(ABC):
     def _build_structure(self):
         """Must be implemented by subclasses to define the topological parent mapping."""
         pass
+
+    # ===============================================
+    # Signature Space Generation and Querying
+    # ===============================================
 
     @staticmethod
     def _compute_space_size(
@@ -377,8 +383,30 @@ class ResponseSignature(ABC):
             # Lazy mode: iterate lazily
             return self.iter_space()
 
+    @property
+    def size(self) -> int:
+        """Return the total number of signatures in the space.
+
+        For materialized mode (lazy=False): returns len(self.space).
+        For lazy mode (lazy=True): returns cached symbolic computation.
+
+        Returns:
+            int: Total signatures, computed once at initialization.
+        """
+        if self._cached_size is not None:
+            return self._cached_size
+        if self.space is not None:
+            return len(self.space)
+        # Fallback: compute size if not yet cached (should not occur in normal flow)
+        return self._compute_space_size(self.domains, self.structure)
+
+    # ===============================================
+    # Querying and Equivalence Classes
+    # ===============================================
+
+    @staticmethod
     def _retrieve_intervention_contexts(
-        self, flat_expr: CausalExpression
+        flat_expr: CausalExpression,
     ) -> tuple[list[dict[str, int]], dict[frozenset, int]]:
         """
         Extracts all unique intervention contexts from a CausalExpression.
@@ -390,6 +418,7 @@ class ResponseSignature(ABC):
 
         Returns:
             Tuple of unique intervention contexts and a mapping from frozensets to context indices.
+            Repeated contexts are deduplicated.
         """
         # Context 0 is always the natural context {}
         contexts = [{}]
@@ -397,10 +426,15 @@ class ResponseSignature(ABC):
 
         for cq in flat_expr.terms.keys():
             for atomic in cq.counterfactuals:
-                frozen_int = frozenset(atomic.interventions.items())
-                if frozen_int not in context_map:
-                    context_map[frozen_int] = len(contexts)
-                    contexts.append(atomic.interventions)
+                try:
+                    frozen_int = frozenset(atomic.interventions.items())
+                    if frozen_int not in context_map:
+                        context_map[frozen_int] = len(contexts)
+                        contexts.append(atomic.interventions)
+                except TypeError:
+                    raise ValueError(
+                        "Nested interventions detected; the method shall be called on a unnested CausalExpression. Call `CausalExpression.unnest(domains)` before passing to this method."
+                    )
 
         return contexts, context_map
 
@@ -417,7 +451,10 @@ class ResponseSignature(ABC):
             flat_expr = CausalExpression({query: 1.0})
             evidence_dict = query.evidence
 
-        contexts, context_map = self._retrieve_intervention_contexts(flat_expr)
+        # Get interventions assignments and their multiplicities within the query.
+        contexts, context_map = ResponseSignature._retrieve_intervention_contexts(
+            flat_expr
+        )
 
         # Build and traverse the MDD to get equivalence classes
         # This should be efficient even for large signature spaces
@@ -435,23 +472,6 @@ class ResponseSignature(ABC):
         )
         print(f"Generated {len(eq_classes)} equivalence classes for the query.")
         return eq_classes
-
-    @property
-    def size(self) -> int:
-        """Return the total number of signatures in the space.
-
-        For materialized mode (lazy=False): returns len(self.space).
-        For lazy mode (lazy=True): returns cached symbolic computation.
-
-        Returns:
-            int: Total signatures, computed once at initialization.
-        """
-        if self._cached_size is not None:
-            return self._cached_size
-        if self.space is not None:
-            return len(self.space)
-        # Fallback: compute size if not yet cached (should not occur in normal flow)
-        return self._compute_space_size(self.domains, self.structure)
 
     def __str__(self):
         return f"ResponseSignature with {len(self.ordered_nodes)} nodes and {self.size:,} functions"
