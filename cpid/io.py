@@ -358,3 +358,27 @@ class CausalExpression:
             raise ValueError("Induced order contains a cycle.")
         except nx.NetworkXNoCycle:
             return order
+
+    def unnest(self, domains: dict[str, int]) -> CausalExpression:
+        """
+        Unnests all queries in this expression and returns a new expression with unnested queries.
+
+        Args:
+            domains: A dict mapping variable names to their domain sizes. Required to
+                determine how many terms to generate when expanding nested interventions.
+                We assume that domain values are in the range [0, domain_size-1].
+
+        Returns:
+            A new `CausalExpression` where all `CausalQuery` terms have been unnested.
+        """
+        new_terms: dict[CausalQuery, float] = {}
+        for cq, w in self.terms.items():
+            unnested = cq.unnest(domains)
+            if isinstance(unnested, CausalQuery):
+                new_terms[unnested] = new_terms.get(unnested, 0.0) + w
+            elif isinstance(unnested, CausalExpression):
+                for q, w_q in unnested.terms.items():
+                    new_terms[q] = new_terms.get(q, 0.0) + w * w_q
+
+        new_terms = {q: w for q, w in new_terms.items() if w != 0}
+        return CausalExpression(new_terms)
