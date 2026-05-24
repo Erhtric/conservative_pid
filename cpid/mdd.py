@@ -1,6 +1,6 @@
 import itertools
 import math
-from cpid.io import CausalExpression
+from cpid.io import CausalExpression, MonotonicityConstraint
 
 
 class ResponseSignatureMDD:
@@ -173,6 +173,7 @@ class ResponseSignatureMDD:
         evidence_dict: dict[str, int],
         context_map: dict[frozenset, int],
         experimental_exprs: list[CausalExpression] | None = None,
+        monotonicity_constraints: list[MonotonicityConstraint] | None = None,
     ) -> dict[tuple, int]:
         """
         Each MDD leaf is associated to a signature row. We tests that tuple against the query:
@@ -180,11 +181,14 @@ class ResponseSignatureMDD:
         2. check if the path satisfies the query evidence (denominator)
         3. check if the path satisfies the query counterfactual conditions (numerator)
         4. (Optional) Evaluate experimental constraints to further split the equivalence classes.
-        5. aggregate counts of paths that share the same key into equivalence classes.
+        5. (Optional) Discard paths violating structural monotonicity conditions.
+        6. aggregate counts of paths that share the same key into equivalence classes.
         """
         equivalence_classes: dict[tuple, int] = {}
         if experimental_exprs is None:
             experimental_exprs = []
+        if monotonicity_constraints is None:
+            monotonicity_constraints = []
 
         node_to_idx = {node: i for i, node in enumerate(self.ordered_nodes)}
         num_nodes = len(self.ordered_nodes)
@@ -212,8 +216,25 @@ class ResponseSignatureMDD:
         query_meta = _get_term_meta(flat_expr)
         exp_meta_list = [_get_term_meta(expr) for expr in experimental_exprs]
 
+        # Pre-process monotonicity constraints into topological metadata
+        mono_meta = []
+        for mc in monotonicity_constraints:
+            y_idx = node_to_idx[mc.target_var]
+            ctx_low = context_map[frozenset(mc.interventions_lower.items())]
+            ctx_high = context_map[frozenset(mc.interventions_upper.items())]
+            mono_meta.append((y_idx, ctx_low, ctx_high))
+
         # Evaluate paths against query and experimental conditions
         for path_tuple, count in self.paths.items():
+            # 1. Monotonicity Filter (Strict checking on path survival)
+            violated = False
+            for y_idx, ctx_low, ctx_high in mono_meta:
+                if path_tuple[y_idx][ctx_high] < path_tuple[y_idx][ctx_low]:
+                    violated = True
+                    break
+            if violated:
+                continue
+
             # Natural context
             nat_tuple = tuple(path_tuple[i][0] for i in range(num_nodes))
 

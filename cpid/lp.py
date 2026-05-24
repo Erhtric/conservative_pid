@@ -6,7 +6,7 @@ from .signature import (
     PartialOrderSignature,
     SignatureQueryEvaluator,
 )
-from .io import CausalExpression, CausalQuery
+from .io import CausalExpression, CausalQuery, MonotonicityConstraint
 
 
 class OrderFunctionalLPSolver:
@@ -82,6 +82,9 @@ class OrderFunctionalLPSolver:
         # Experimental/interventional constraints provided by user.
         self.experimental_constraints: dict[CausalExpression, float] = {}
 
+        # Structural Monotonicity constraints provided by user.
+        self.monotonicity_constraints: list[MonotonicityConstraint] = []
+
         self.query = query
 
     def add_experimental_constraint(
@@ -112,11 +115,23 @@ class OrderFunctionalLPSolver:
 
         self.experimental_constraints[expr] = value
 
-    def add_monotonicity_constraint(self):
-        pass
-
-    def add_exogeneity_constraint(self):
-        pass
+    def add_monotonicity_constraint(
+        self,
+        target_var: str,
+        interventions_lower: dict[str, int],
+        interventions_upper: dict[str, int],
+    ):
+        """
+        Adds a structural monotonicity constraint on the target_var.
+        This forces the target variable's value to be non-decreasing when the interventions
+        transition from interventions_lower to interventions_upper.
+        """
+        constraint = MonotonicityConstraint(
+            target_var=target_var,
+            interventions_lower=interventions_lower,
+            interventions_upper=interventions_upper,
+        )
+        self.monotonicity_constraints.append(constraint)
 
     @staticmethod
     def _flatten_query_or_expr(
@@ -168,6 +183,7 @@ class OrderFunctionalLPSolver:
         eq_classes = self.signature_obj.get_equivalence_classes(
             self.query,
             experimental_constraints=[expr for expr in self.experimental_constraints],
+            monotonicity_constraints=self.monotonicity_constraints,
         )
 
         bounds = []
@@ -286,6 +302,14 @@ class OrderFunctionalLPSolver:
                 prob.solve(pulp.PULP_CBC_CMD(msg=self.solver_verbose))
                 bounds.append(pulp.value(prob.objective))
                 pulp_probs.append(prob)
+
+        print(f"LP Status: {[pulp.LpStatus[prob.status] for prob in pulp_probs]}")
+
+        # Check if the optimal solution is reached
+        if any(pulp.LpStatus[prob.status] != "Optimal" for prob in pulp_probs):
+            print(
+                "Warning: LP did not reach optimal solution. Check solver status for details."
+            )
 
         if return_lp:
             return tuple(bounds), pulp_probs

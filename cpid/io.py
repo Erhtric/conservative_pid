@@ -5,6 +5,30 @@ import networkx as nx
 
 
 @dataclass(frozen=True, repr=False)
+class MonotonicityConstraint:
+    """
+    Represents a structural monotonicity constraint on a target variable.
+
+    For example, Y_{X=1} >= Y_{X=0} is:
+    target_var="Y",
+    interventions_lower={"X": 0},
+    interventions_upper={"X": 1}
+    """
+
+    target_var: str
+    interventions_lower: dict[str, int]
+    interventions_upper: dict[str, int]
+
+    def __str__(self):
+        low_str = ", ".join(f"{k}={v}" for k, v in self.interventions_lower.items())
+        up_str = ", ".join(f"{k}={v}" for k, v in self.interventions_upper.items())
+        return f"{self.target_var}_{{{up_str}}} >= {self.target_var}_{{{low_str}}}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass(frozen=True, repr=False)
 class AtomicCounterfactual:
     """
     Represents a single atomic proposition: e.g., Y_{x=1} = 1. In this case

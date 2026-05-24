@@ -6,6 +6,39 @@ import numpy as np
 import itertools
 
 
+def generate_monotonic_tian_df(
+    domains: dict[str, int] = {"X": 2, "Y": 2},
+    sample_size: int = 10000,
+    seed: int = 42,
+    include_counterfactuals: bool = True,
+) -> pd.DataFrame:
+    np.random.seed(seed)
+
+    dx = domains["X"]
+    dy = domains["Y"]
+    num_functions = dy**dx
+    p_uy = np.random.dirichlet(np.ones(num_functions))
+
+    # Force strict positive monotonicity
+    p_uy[2] = 0.0
+    p_uy = p_uy / p_uy.sum()  # Re-normalize
+
+    p_x = np.random.dirichlet(np.ones(domains["X"]))
+
+    X = np.random.choice(list(range(dx)), size=sample_size, p=p_x)
+    Uy = np.random.choice(list(range(num_functions)), size=sample_size, p=p_uy)
+
+    response_table = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
+    Y = response_table[Uy, X]
+
+    df = pd.DataFrame({"X": X, "Y": Y})
+    if include_counterfactuals:
+        for x_val in range(dx):
+            df[f"Y_{{X={x_val}}}"] = response_table[Uy, x_val]
+
+    return df
+
+
 def generate_canonical_tian_df(
     domains: dict[str, int] = {"X": 2, "Y": 2},
     seed: int = 42,

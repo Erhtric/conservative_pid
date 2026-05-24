@@ -406,15 +406,13 @@ class ResponseSignature(ABC):
 
     @staticmethod
     def _retrieve_intervention_contexts(
-        *exprs: CausalExpression,
+        exprs: list[CausalExpression],
+        monotonicity_constraints: list[MonotonicityConstraint] | None = None,
     ) -> tuple[list[dict[str, int]], dict[frozenset, int]]:
         """
-        Extracts all unique intervention contexts from one or more CausalExpressions.
+        Extracts all unique intervention contexts from CausalExpressions and MonotonicityConstraints.
 
         Empty context {} is always included as the natural observational context.
-
-        Args:
-            *exprs: One or more CausalExpression objects representing the query and experiments.
 
         Returns:
             Tuple of unique intervention contexts and a mapping from frozensets to context indices.
@@ -437,12 +435,26 @@ class ResponseSignature(ABC):
                             "Nested interventions detected; the method shall be called on a unnested CausalExpression. Call `CausalExpression.unnest(domains)` before passing to this method."
                         )
 
+        if monotonicity_constraints:
+            for mc in monotonicity_constraints:
+                for ints in (mc.interventions_lower, mc.interventions_upper):
+                    try:
+                        frozen_int = frozenset(ints.items())
+                        if frozen_int not in context_map:
+                            context_map[frozen_int] = len(contexts)
+                            contexts.append(ints)
+                    except TypeError:
+                        raise ValueError(
+                            "Nested interventions detected in monotonicity constraint."
+                        )
+
         return contexts, context_map
 
     def get_equivalence_classes(
         self,
         query: CausalQuery | CausalExpression,
         experimental_constraints: list[CausalExpression] | None = None,
+        monotonicity_constraints: list[MonotonicityConstraint] | None = None,
     ) -> dict[tuple, int]:
         """Retrieve query-relevant equivalence classes of signatures using an MDD.
 
@@ -461,9 +473,10 @@ class ResponseSignature(ABC):
         if experimental_constraints is None:
             experimental_constraints = []
 
-        # Get intervention assignments from both query and experimental constraints.
+        # Get intervention assignments from both query and constraints.
+        expr_list = [flat_expr] + experimental_constraints
         contexts, context_map = ResponseSignature._retrieve_intervention_contexts(
-            flat_expr, *experimental_constraints
+            expr_list, monotonicity_constraints
         )
 
         # Build and traverse the MDD to get equivalence classes
@@ -479,6 +492,7 @@ class ResponseSignature(ABC):
             evidence_dict=evidence_dict,
             context_map=context_map,
             experimental_exprs=experimental_constraints,
+            monotonicity_constraints=monotonicity_constraints,
         )
         print(f"Generated {len(eq_classes)} equivalence classes.")
         return eq_classes
