@@ -1,3 +1,5 @@
+import itertools
+
 import pandas as pd
 import pulp
 
@@ -6,7 +8,12 @@ from .signature import (
     PartialOrderSignature,
     SignatureQueryEvaluator,
 )
-from .io import CausalExpression, CausalQuery, MonotonicityConstraint
+from .io import (
+    CausalExpression,
+    CausalQuery,
+    MonotonicityConstraint,
+    AtomicCounterfactual,
+)
 
 
 class OrderFunctionalLPSolver:
@@ -97,7 +104,6 @@ class OrderFunctionalLPSolver:
         Args:
             target_expr: A CausalQuery or CausalExpression representing the causal quantity to constrain.
             value: The numerical value that the target_expr is constrained to equal.
-
         """
         expr = self._flatten_query_or_expr(target_expr, self.domains)
         if isinstance(expr, CausalQuery):
@@ -125,6 +131,11 @@ class OrderFunctionalLPSolver:
         Adds a structural monotonicity constraint on the target_var.
         This forces the target variable's value to be non-decreasing when the interventions
         transition from interventions_lower to interventions_upper.
+
+        Args:
+            target_var: The variable on which the monotonicity constraint is applied (e.g., "Y").
+            interventions_lower: A dict specifying the lower intervention configuration (e.g., {"X": 0}).
+            interventions_upper: A dict specifying the upper intervention configuration (e.g., {"X": 1}).
         """
         constraint = MonotonicityConstraint(
             target_var=target_var,
@@ -133,6 +144,72 @@ class OrderFunctionalLPSolver:
         )
         self.monotonicity_constraints.append(constraint)
 
+    def add_exogeneity_constraint(
+        self, target_vars: str | list[str], intervention_vars: str | list[str]
+    ):
+        """
+        Enforces exogeneity by asserting P(Y_{X=x} = y) = P(Y = y | X = x).
+
+        The rhs is computed from the empirical data and added as an experimental constraint.
+
+        Args:
+            target_vars: The variable(s) in the counterfactual whose distribution is being constrained (e.g., "Y").
+            intervention_vars: The variable(s) being intervened upon (e.g., "X").
+        """
+        if isinstance(target_vars, str):
+            target_vars = [target_vars]
+        if isinstance(intervention_vars, str):
+            intervention_vars = [intervention_vars]
+
+        missing = [v for v in target_vars + intervention_vars if v not in self.domains]
+        if missing:
+            raise ValueError(f"Variables {missing} not found in domains.")
+
+        target_indices = [
+            self.signature_obj.ordered_nodes.index(var) for var in target_vars
+        ]
+        int_indices = [
+            self.signature_obj.ordered_nodes.index(var) for var in intervention_vars
+        ]
+
+        # 1. Compute marginals and joints in a single pass over the empirical data to eliminate repetition
+        p_x = {}
+        p_yx = {}
+
+        for obs_tuple, prob in self.data_dist.items():
+            x_vals = tuple(obs_tuple[idx] for idx in int_indices)
+            y_vals = tuple(obs_tuple[idx] for idx in target_indices)
+
+            p_x[x_vals] = p_x.get(x_vals, 0.0) + prob
+            p_yx[(y_vals, x_vals)] = p_yx.get((y_vals, x_vals), 0.0) + prob
+
+        # 2. Iterate strictly over the relevant subspace domains, preventing a doubly exponential loop
+        y_domains = [range(self.domains[var]) for var in target_vars]
+        x_domains = [range(self.domains[var]) for var in intervention_vars]
+
+        for y_vals, x_vals in itertools.product(
+            itertools.product(*y_domains), itertools.product(*x_domains)
+        ):
+            # Skip evaluating unobserved intervention configurations
+            if p_x.get(x_vals, 0.0) == 0.0:
+                continue
+
+            conditional_prob = p_yx.get((y_vals, x_vals), 0.0) / p_x[x_vals]
+
+            cfs = []
+            for t_var, y_val in zip(target_vars, y_vals):
+                valid_ints = {
+                    i_var: x_val for i_var, x_val in zip(intervention_vars, x_vals)
+                }
+                cfs.append(
+                    AtomicCounterfactual(
+                        target_var=t_var, target_val=y_val, interventions=valid_ints
+                    )
+                )
+
+            query = CausalQuery(counterfactuals=cfs)
+            self.add_experimental_constraint(target_expr=query, value=conditional_prob)
+
     @staticmethod
     def _flatten_query_or_expr(
         qobj: CausalQuery | CausalExpression,
@@ -140,7 +217,6 @@ class OrderFunctionalLPSolver:
     ) -> CausalExpression:
         """Return a CausalExpression representing the (possibly unnested) linear combination."""
         if isinstance(qobj, CausalQuery):
-            print(f"Unnesting query {qobj}")
             u = qobj.unnest(domains)
             if isinstance(u, CausalQuery):
                 return CausalExpression({u: 1.0})
@@ -148,7 +224,6 @@ class OrderFunctionalLPSolver:
         # CausalExpression: unnest each term and merge
         terms: dict[CausalQuery, float] = {}
         for cq, w in qobj.terms.items():
-            print(f"Unnesting term {cq} with weight {w}")
             u = cq.unnest(domains)
             if isinstance(u, CausalQuery):
                 terms[u] = terms.get(u, 0.0) + w
