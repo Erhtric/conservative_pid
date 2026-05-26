@@ -144,11 +144,76 @@ class OrderFunctionalLPSolver:
         )
         self.monotonicity_constraints.append(constraint)
 
-    def add_exogeneity_constraint(
+    def add_strong_exogeneity_constraint(self, target_var: str, intervention_var: str):
+        """
+        Enforces strong exogeneity X || {Y_x, Y_x'}.
+
+        Consider a signature over 2 binary variables X and Y, then S = {X, Y_{X=0}, Y_{X=1}}.
+        Consider an decision variable then P(X, Y_{X=0}, Y_{X=1}) = P(X)P(Y_{X=0}, Y_{X=1}) by strong exogeneity.
+        This means that can be applied (per signature row) the constraint P(X=x, Y_{X=0}=y0, Y_{X=1}=y1) = P(X=x)P(Y_{X=0}=y0, Y_{X=1}=y1) for all x,y0,y1.
+
+        If we deal with eq classes like <v_obs, num_coeff, den_coeff, exp1_coeff, ... expk_coeff>, then the strong exogeneity constraint means that for each
+        eq class we can add the constraint that the probability mass assigned to that eq class must factor
+        as P(X=x)P(Y_{X=0}=y0, Y_{X=1}=y1) where x,y0,y1 are the values of X, Y_{X=0}, Y_{X=1} in that eq class.
+        This can be done at the MDD level?
+
+        Args:
+            target_var: The variable on which the exogeneity constraint is applied (e.g., "Y").
+            intervention_var: The variable being intervened upon (e.g., "X").
+        """
+        x_domain = range(self.domains[intervention_var])
+        y_domain = range(self.domains[target_var])
+        if len(x_domain) != 2:
+            raise NotImplementedError(
+                "Strong exogeneity constraint currently only implemented for binary interventions."
+            )
+
+        x_idx = self.signature_obj.ordered_nodes.index(intervention_var)
+
+        p_x = {}
+        for obs_tuple, prob in self.data_dist.items():
+            x_val = obs_tuple[x_idx]
+            p_x[x_val] = p_x.get(x_val, 0.0) + prob
+
+        # Iterate over all combinations of (Y_x0 = y, Y_x1 = y')
+        # For a binary intervention, this is a Cartesian product of the target domain
+        for joint_y_vals in itertools.product(y_domain, repeat=len(x_domain)):
+            # Create the joint counterfactual event: e.g., (Y_{x=0}=y_0 AND Y_{x=1}=y_1)
+            joint_cfs = [
+                AtomicCounterfactual(
+                    target_var=target_var,
+                    target_val=y_val,
+                    interventions={intervention_var: x_val},
+                )
+                for x_val, y_val in zip(x_domain, joint_y_vals)
+            ]
+
+            # The base query: P(Y_{x0}=y, Y_{x1}=y')
+            base_query = CausalQuery(counterfactuals=joint_cfs)
+
+            for x_val in x_domain:
+                if p_x.get(x_val, 0.0) == 0.0:
+                    continue
+
+                # The joint query: P(Y_{x0}=y, Y_{x1}=y', X=x)
+                specific_cfs = list(joint_cfs) + [
+                    AtomicCounterfactual(
+                        target_var=intervention_var, target_val=x_val, interventions={}
+                    )
+                ]
+                specific_query = CausalQuery(counterfactuals=specific_cfs)
+
+                # Add to the solver: P(Y_x, Y_x', X=x) - P(X=x) * P(Y_x, Y_x') = 0
+                expr = CausalExpression(
+                    {specific_query: 1.0, base_query: -float(p_x[x_val])}
+                )
+                self.add_experimental_constraint(target_expr=expr, value=0.0)
+
+    def add_weak_exogeneity_constraint(
         self, target_vars: str | list[str], intervention_vars: str | list[str]
     ):
         """
-        Enforces exogeneity by asserting P(Y_{X=x} = y) = P(Y = y | X = x).
+        Enforces weakexogeneity by asserting P(Y_{X=x} = y) = P(Y = y | X = x).
 
         The rhs is computed from the empirical data and added as an experimental constraint.
 
@@ -172,7 +237,7 @@ class OrderFunctionalLPSolver:
             self.signature_obj.ordered_nodes.index(var) for var in intervention_vars
         ]
 
-        # 1. Compute marginals and joints in a single pass over the empirical data to eliminate repetition
+        # Compute marginals and joints
         p_x = {}
         p_yx = {}
 
@@ -183,10 +248,8 @@ class OrderFunctionalLPSolver:
             p_x[x_vals] = p_x.get(x_vals, 0.0) + prob
             p_yx[(y_vals, x_vals)] = p_yx.get((y_vals, x_vals), 0.0) + prob
 
-        # 2. Iterate strictly over the relevant subspace domains, preventing a doubly exponential loop
-        y_domains = [range(self.domains[var]) for var in target_vars]
+        y_domains = [range(self.domains[var] - 1) for var in target_vars]
         x_domains = [range(self.domains[var]) for var in intervention_vars]
-
         for y_vals, x_vals in itertools.product(
             itertools.product(*y_domains), itertools.product(*x_domains)
         ):
